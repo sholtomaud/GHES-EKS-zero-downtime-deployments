@@ -1,6 +1,6 @@
 # Proposal: local development workflow
 
-**Status:** Proposed, for review (rev 3)  ·  **Date:** 2026-10-10  ·  **ADR:** [ADR-0003](../adr/0003-local-development-workflow.md)
+**Status:** Proposed, for review (rev 4)  ·  **Date:** 2026-10-10  ·  **ADR:** [ADR-0003](../adr/0003-local-development-workflow.md)
 
 > **Rev 2 incorporates answers to Q21–Q25.** Laptops already route to the dev
 > VPC, so they connect **directly on 5432, through a narrowly scoped security
@@ -13,11 +13,17 @@
 > connects to the shared dev RDS only when they need it, by adding a
 > **`./.env.local`** file (§5.2). The VPN is **always on**, so the SG source is
 > simply the VPN client pool, and the SSM fallback is gone (§5.5).
+>
+> **Rev 4:** local synthetic data comes from a **generator script**. No data
+> files are stored in the repo (§5.3). The **dev RDS holds the "dirty" test
+> data**, and `.env.local` points at it. Dev is **not reset to synthetic data**:
+> its contents are the point (§5.2). Q28 asks whether that dirty data contains
+> real personal data, because the answer changes how laptops may connect.
 
 How a developer on a Windows laptop builds and runs the `api`, `agent` and
-`frontend` containers locally in VS Code. It runs against synthetic data by
-default, and against the shared **dev** Postgres on RDS when the developer
-needs it. This covers the inner loop only. The release path (PROPOSAL.md §3)
+`frontend` containers locally in VS Code. It runs against generated synthetic
+data by default, and against the shared **dev** Postgres on RDS, with its
+"dirty" test data, when the developer needs it. This covers the inner loop only. The release path (PROPOSAL.md §3)
 doesn't change.
 
 Requirements cited as `[DEV-xx]` are **proposed** in
@@ -46,9 +52,9 @@ The recommended setup on each laptop:
 - **VS Code on Windows**, using the WSL and Dev Containers extensions.
 - **The repo cloned inside the WSL filesystem** (`~/src/...`), never under `/mnt/c`.
 
-`make dev` with no configuration runs against a **local Postgres seeded with
-synthetic data**. Adding a `./.env.local` file switches the stack to the
-**shared dev RDS**. Either way, every start prints which database is in use.
+`make dev` with no configuration runs against a **local Postgres populated by a
+seed script with generated synthetic data**. Adding a `./.env.local` file
+switches the stack to the **shared dev RDS with the dirty test data**. Either way, every start prints which database is in use.
 The clean database holds real data. Laptops can only query it, read-only,
 through each person's own login, and it's never copied off RDS. Local code may
 run migrations only against the local Postgres.
@@ -70,7 +76,7 @@ flowchart LR
   end
   subgraph aws[Dev AWS account]
     sg{{SG: tcp/5432 from<br/>VPN client pool only<br/>TLS required}}
-    dev[(RDS dev<br/>shared with dev EKS<br/>DML only from laptops)]
+    dev[(RDS dev · dirty test data<br/>shared with dev EKS<br/>DML only from laptops)]
     clean[(RDS clean<br/>real data · query only<br/>named IAM logins)]
   end
   api & agent -.->|with .env.local<br/>always-on VPN| sg -.-> dev
@@ -191,8 +197,8 @@ app/
 │   └── frontend/Dockerfile
 └── scripts/dev/
     ├── bootstrap-wsl.sh          # one-time: podman, compose, systemd, aws cli, RDS CA bundle
-    ├── db-creds.sh               # fetch dev DB secret → .dev/secrets (0600)
-    └── fixtures/                 # synthetic seed data for DB=local and the dev reset
+    ├── up.sh                     # what `make dev` runs: SSO check → fetch DB password → compose up (§5.2.1)
+    └── seed/                     # generator script: synthetic data for DB=local (no data files)
 ```
 
 **The same Dockerfiles as the release [DEV-02].** Each service Dockerfile has a
@@ -218,7 +224,7 @@ as every environment (AGENTS.md rule 7) [DEV-02].
 | Target | Does | Notes |
 |---|---|---|
 | `make bootstrap` | One-time WSL setup (`scripts/dev/bootstrap-wsl.sh`). Idempotent. | Checks repo isn't under `/mnt/c`, and that systemd and the Podman socket are running |
-| `make dev` | No `.env.local`: starts local Postgres, seeds it from `fixtures/`, runs migrations, then `compose up --build`. With `.env.local`: `db-creds` → `compose up --build` against dev RDS. | Prints a banner with the DB target |
+| `make dev` | No `.env.local`: starts local Postgres, runs migrations, runs the seed generator, then `compose up --build`. With `.env.local`: `scripts/dev/up.sh` checks your AWS login, fetches the DB password from Secrets Manager, then runs `compose up --build` against dev RDS (§5.2.1). | Prints a banner with the DB target |
 | `make dev DB=local` | Forces the local database even if `.env.local` exists | Quick switch back without deleting the file |
 | `make env-local` | Writes `.env.local` for the shared dev RDS (§5.2) | Needs `aws sso login` and the DevDatabaseAccess permission set |
 | `make db-shell` | `psql` against whichever DB the stack uses: local, or dev as **you** (IAM auth token) | Attributable, short-lived |
@@ -265,19 +271,19 @@ else changes.
 
 | `DB=` | Where | Laptop access | Can run DDL? | Default? | Use for |
 |---|---|---|---|---|---|
-| **`local`** | Podman container on the laptop, seeded from the synthetic fixture set, discarded on `make down` | Owner | **Yes** | **Yes** (no `.env.local`) | Everyday feature work, migrations, destructive experiments, working offline |
-| `dev` | RDS, dev account. **Shared with the dev EKS environment** (Q25). | Only with `.env.local`. App containers: `app_dev_local`, DML only. People: own IAM login, DML only. | **No** | No | Work that needs the shared data set, or integration with what's deployed in the dev environment |
+| **`local`** | Podman container on the laptop, populated by the seed generator, discarded on `make down` | Owner | **Yes** | **Yes** (no `.env.local`) | Everyday feature work, migrations, destructive experiments, working offline |
+| `dev` | RDS, dev account. **The "dirty" test data**: messy, realistic data for testing against. **Shared with the dev EKS environment** (Q25). | Only with `.env.local`. App containers: `app_dev_local`, DML only. People: own IAM login, DML only. | **No** | No | Testing against messy, realistic data; integration with what's deployed in the dev environment |
 | `clean` | RDS, dev account. **Real data** (Q22). | **People only**, each with their own IAM login mapped to `clean_reader` (SELECT only). No app containers, no shared credential. | No | No | Querying real data to understand a bug or check an assumption |
 
 ### 5.2 Choosing the target: `.env.local` [DEV-03]
 
-For now, synthetic data on the laptop is the default. The shared dev RDS is
-opt-in, per developer, by adding one file.
+For now, generated synthetic data on the laptop is the default. The dev RDS,
+with its dirty test data, is opt-in per developer by adding one file.
 
 1. **No file, local data.** `make dev` with no `.env.local` starts the local
-   Postgres from `fixtures/`. It needs no AWS access, so a new starter is
+   Postgres and populates it with the seed generator (§5.3). It needs no AWS access, so a new starter is
    productive before their database access is granted.
-2. **`.env.local` switches the stack to dev RDS.** compose loads it as an
+2. **`.env.local` points the stack at the dirty data on dev RDS.** compose loads it as an
    optional `env_file` for `api` and `agent` only *(verify `env_file.required:
    false` on the compose version we pin)*. It holds **connection settings, not
    credentials**:
@@ -285,7 +291,7 @@ opt-in, per developer, by adding one file.
    ```sh
    # .env.local: written by `make env-local`; gitignored; never committed
    DB_TARGET=dev
-   PGHOST=<dev-rds-endpoint>        # RDS endpoint name, resolves over the VPN
+   PGHOST=<dev-rds-endpoint>        # the dirty-data RDS instance; resolves over the VPN
    PGPORT=5432
    PGDATABASE=app
    PGUSER=app_dev_local
@@ -300,7 +306,7 @@ opt-in, per developer, by adding one file.
    would rather hand out a file containing a password, make it a **per-person**
    login so it stays attributable and revocable, never a shared one [DEV-06].
 3. **Every start shows the target.** `make dev` prints
-   `DB: local (synthetic)` or `DB: dev (shared with dev EKS, <endpoint>)`, and
+   `DB: local (generated, SEED=42)` or `DB: dev (dirty test data, shared with dev EKS, <endpoint>)`, and
    the frontend shows a matching corner badge. Nobody is unsure which database
    they're on.
 4. **The frontend never sees `.env.local`.** Only `api` and `agent` load it,
@@ -308,15 +314,53 @@ opt-in, per developer, by adding one file.
    settings can't end up in a browser bundle.
 5. **Clean isn't a place to run the app.** The stack can't target it at all.
    Clean can only be queried by a named person, read-only.
-6. **Dev is kept useful.** A scheduled job **resets dev from the same synthetic
-   fixture set** (e.g. weekly, or on demand via a GHES workflow), then
-   re-applies migrations from `main`. **The reset never copies from clean**:
-   that would put real data into a writable database every laptop can reach.
-   One fixture set feeds both local and dev, so moving between them doesn't
-   change the shape of the data.
+6. **Dev isn't reset to synthetic data.** Its dirty data is the reason to
+   connect to it, so this proposal doesn't add a reset job. Laptop roles have
+   no DDL rights, so a branch can't break dev's schema (§5.3). They can change
+   rows, though. If shared edits start making the dirty data unreliable, the
+   fix is a snapshot of dev to restore from, not overwriting it with synthetic
+   data.
 
-**Later:** once fixtures and dev access are settled, the default can flip to
-dev by having `make bootstrap` run `make env-local`. Nothing else changes.
+**Later:** once the generator and dev access are settled, the default can flip
+to dev by having `make bootstrap` run `make env-local`. Nothing else changes.
+
+#### 5.2.1 What `make dev` does when `.env.local` exists
+
+Yes: one script in the repo, `scripts/dev/up.sh`, does it all, and `make dev`
+calls it. It uses the developer's AWS login to fetch the password from Secrets
+Manager, then starts the containers with the URL and password. It's about 30
+lines of shell:
+
+```sh
+# scripts/dev/up.sh (sketch, not final)
+set -euo pipefail
+set -a; . ./.env.local; set +a                        # URL parts + DB_SECRET_ID, no password
+
+aws sts get-caller-identity >/dev/null 2>&1 \
+  || aws sso login --profile "${AWS_PROFILE:-dev}"    # browser opens once; cached ~8-12 h
+
+run="${XDG_RUNTIME_DIR}/app"; install -d -m 700 "$run"
+aws secretsmanager get-secret-value --secret-id "$DB_SECRET_ID" \
+    --query SecretString --output text \
+  | jq -r '"PGPASSWORD=\(.password)"' > "$run/db.env"  # tmpfs, never in the repo
+chmod 600 "$run/db.env"
+
+echo "DB: dev (dirty test data) ${PGUSER}@${PGHOST}:${PGPORT}/${PGDATABASE}"
+DB_ENV_FILE="$run/db.env" podman compose up --build   # compose reads env_file: ${DB_ENV_FILE}
+```
+
+| Step | Why this way |
+|---|---|
+| URL in `.env.local`, password from Secrets Manager | The file can be handed around or regenerated freely. Rotating the password needs no change on any laptop. |
+| `aws sso login` only if the session has expired | One browser login per working day, not per start |
+| Password written to `$XDG_RUNTIME_DIR` (tmpfs) | Never in the repo directory, so it can't be committed by accident, and it disappears when WSL shuts down |
+| Passed to `api`/`agent` as an `env_file` | The same shape as the K8s Secret in clusters, so the app code path is identical (PROPOSAL.md §2.2) |
+| Same script whether you start from the terminal, a VS Code task, or the Dev Container | One way to start the stack [DEV-01] |
+
+**Podman or Docker?** The compose file and script work with either engine
+(`podman compose` / `docker compose`). The proposal uses Podman to avoid the
+Docker Desktop licence (§3), so "docker containers" here just means OCI
+containers.
 
 ### 5.3 Why laptops must not run migrations against shared dev [DEV-04]
 
@@ -332,16 +376,28 @@ later fail on a schema it didn't create. So:
   requires release N to run on schema N-1 and N+1. The same rule means branch
   code runs against `main`'s schema. A local stack that breaks on dev's schema
   is an early warning of a migration that would break zero-downtime rollback.
-- **Local DB seed:** from the **synthetic fixture set** checked into the repo,
-  never from clean (Q22). Seeding happens on every `make dev` without
-  `.env.local` and takes seconds.
+- **Local DB seed: a generator script, not stored data.**
+  `scripts/dev/seed/` runs after migrations and inserts synthetic rows through
+  the current schema. That means:
+  - no data files in the repo to review, store, or drift from the schema;
+  - the generator is versioned with the migrations, so the seed always matches
+    the branch's schema;
+  - nothing from clean or dev is ever copied (Q22).
+
+  Keep it **deterministic**: a fixed random seed (`SEED=42` by default), so a
+  bug seen on one laptop reproduces on another. Keep it **sized by a
+  parameter** (`ROWS=small|large`), so most runs take seconds but load-ish
+  testing is still possible. Make it **deliberately messy where it matters**:
+  nulls, unicode, boundary values, duplicates the app must tolerate. Then local
+  work catches some of what the dirty data would. The generator runs only
+  against `local`: `make seed` refuses when `.env.local` is active.
 
 ### 5.4 Credentials and clean-data controls [DEV-06, DEV-08]
 
 | Who | Target | How | Stored |
 |---|---|---|---|
 | People (`psql`, GUI client) | dev, clean | **RDS IAM database authentication**: `aws sso login`, then `make db-shell` generates a token (valid 15 min for *connecting*; the session outlives it). One Postgres login per person, granted `rds_iam`. | Nowhere: generated per connection |
-| Local app containers (`api`, `agent`) | dev only, when `.env.local` exists | `app_dev_local` password from **Secrets Manager** (`DB_SECRET_ID` in `.env.local`), fetched by `make db-creds` using your SSO session; rotated | `.dev/secrets/db.env`, mode 0600, gitignored, injected as env/file exactly as the K8s Secret is in clusters |
+| Local app containers (`api`, `agent`) | dev only, when `.env.local` exists | `app_dev_local` password from **Secrets Manager** (`DB_SECRET_ID` in `.env.local`), fetched by `scripts/dev/up.sh` using your SSO session; rotated | `$XDG_RUNTIME_DIR/app/db.env` (tmpfs, mode 0600, gone on WSL shutdown), injected as env/file exactly as the K8s Secret is in clusters |
 
 **Clean is query-only, not copy.** Postgres can't technically stop someone who
 can `SELECT` from saving the result. So the controls are about making that
@@ -360,10 +416,13 @@ deliberate, attributable and visible, not impossible:
   refresh hook when it reconnects after 15 minutes. If the app doesn't already
   support that, a static role password delivered the way the cluster delivers
   it (a Secret → env/file, PROPOSAL.md §2.2) keeps the app's code path
-  identical everywhere. That's acceptable for dev because dev holds synthetic
-  data only. If the app gains IAM auth for prod (SEC-05), switch local over too.
-- **No credentials in Git or images** [SEC-02]. `.dev/`, `.env` and
-  `.env.local` are gitignored, and secret scanning runs in CI.
+  identical everywhere. That's acceptable for dev **only if the dirty data
+  holds no real personal data (Q28).** If it does, dev needs the same
+  per-person, audited access as clean: an IAM-authenticated login per
+  developer, with token refresh in the app or a per-person password in
+  `.env.local`. If the app gains IAM auth for prod (SEC-05), switch local over too.
+- **No credentials in Git or images** [SEC-02]. `.env` and `.env.local`
+  are gitignored (and `.env.local` holds no password anyway), and secret scanning runs in CI.
 - **Permission sets:** "DevDatabaseAccess" allows `rds-db:connect` to your dev
   user and `secretsmanager:GetSecretValue` on the one laptop secret.
   "CleanDataReader" allows `rds-db:connect` to your clean user only. Neither
@@ -423,7 +482,7 @@ Multi-AZ). It doesn't change the verdict for any profile.
 | DEV-05 Clone to running stack < 1 h on Windows | `make bootstrap`, Dev Container | Timed onboarding of a new team member |
 | DEV-06 No long-lived DB creds on laptops for humans; none in Git | IAM DB auth; Secrets Manager fetch; `.gitignore` | IAM review; secret scanning |
 | DEV-07 No paid container-desktop licence required | Podman rootless | Onboarding doc lists no paid tool |
-| DEV-08 Clean data is query-only from laptops: named, read-only, audited, never copied | IAM-only logins, `clean_reader`, pgaudit, no dump tooling, synthetic seeds (§5.4) | Password login to clean fails; a `SELECT` appears in the audit log under a person's name; repo contains no dump of clean |
+| DEV-08 Clean data is query-only from laptops: named, read-only, audited, never copied | IAM-only logins, `clean_reader`, pgaudit, no dump tooling, generated local data (§5.3–5.4) | Password login to clean fails; a `SELECT` appears in the audit log under a person's name; repo contains no dump of clean |
 
 ---
 
@@ -432,12 +491,13 @@ Multi-AZ). It doesn't change the verdict for any profile.
 | # | Assumption | If wrong | Q |
 |---|---|---|---|
 | R1 | ~~Laptops can reach the dev VPC~~ **Confirmed** (Q21). VPN is always on. Remaining: the VPN route also reaches *inside WSL2* | `networkingMode=mirrored`; failing that, the VPN vendor's WSL guidance | Q21 |
-| R2 | **Resolved: clean holds real data** (Q22). Design changed: query-only, named and audited access; synthetic seeds; dev not reset from clean. | Revisit masked data only if synthetic proves too thin | Q22, Q26 |
+| R2 | **Resolved: clean holds real data** (Q22). Design changed: query-only, named and audited access; generated local data; nothing copied from clean. | — | Q22, Q26 |
+| R9 | The dirty data on dev holds **no real personal or customer data** | Laptop access to dev moves from the shared `app_dev_local` role to per-person, audited logins (as clean), and the app containers must use them | Q28 |
 | R3 | WSL2 + rootless Podman + Dev Containers works on our managed Windows build (endpoint security, Hyper-V policy). **Believed yes** (Q23). | Slice 1 will show it. Fallback: option A for toolchain, then option F if WSL itself is blocked. | Q23 |
 | R4 | **Resolved:** no corporate CA or proxy needed (Q24) | — | Q24 |
 | R5 | The app reads DB settings from env/file (hosting contract §2.2), so local and cluster delivery are identical | Small app change, needed for portability anyway | Q7 |
 | R6 | Branch code tolerates `main`'s schema (expand/contract) | That's a ZDT-05 violation, which the local stack exposes early. That's a feature. | — |
-| R7 | **Believed shared** with dev EKS (Q25). Laptop writes land in the dev environment's data, which is fine for synthetic data. | If laptop activity disrupts dev-env testing, give laptops their own database on the same instance, reset from fixtures on the same schedule. | Q25 |
+| R7 | **Believed shared** with dev EKS (Q25). Laptop writes land in the dirty test data the dev environment also uses. | If laptop edits make that data unreliable, take a snapshot of dev to restore from, or give laptops their own copy on the same instance. | Q25 |
 | R8 | The application owner approves named, audited, read-only laptop access to real data in clean | If not, clean is reachable only from an in-VPC host (e.g. via SSM), never directly from laptops | Q22 |
 
 Unverified items, which slice 1 must check against current docs and cite:
@@ -458,7 +518,7 @@ Unverified items, which slice 1 must check against current docs and cite:
 | 1 | On **one real managed Windows laptop**: WSL2 + Podman + compose + Dev Container for `api` only, with `DB=local`. Settle the keep-id/user combination. **Prove the VPN route reaches RDS from inside a rootless container in WSL.** | R1, R3, DEV-07 | 2–3 days |
 | 2 | Dev account: two RDS instances, VPN-pool prefix list + SGs, `force_ssl`, roles and grants, IAM-only clean with pgaudit, two SSO permission sets, one Secrets Manager secret. In IaC. | DEV-04, DEV-06, DEV-08, §5.5 | 3–4 days |
 | 3 | `make dev` for api + agent + frontend: local synthetic by default, dev RDS via `make env-local`/`.env.local`; `pin-release`/`SRC=`; tasks.json, launch.json; banner | DEV-01/02/03 | 3–4 days |
-| 4 | Synthetic fixture set + scheduled dev reset from it, then migrations from `main` (GHES workflow → CodeBuild in VPC, same pattern as deploys) | §5.2 point 5 | 3 days |
+| 4 | Seed generator (deterministic, sized, deliberately messy), `make seed`, refusal when `.env.local` is active | §5.3, DEV-03 | 2–3 days |
 | 5 | Timed onboarding with a new team member; fix what they hit | DEV-05 | 1 day |
 
 About **2–3 weeks** for one engineer. It can run in parallel with PROPOSAL.md
