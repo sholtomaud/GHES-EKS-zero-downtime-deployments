@@ -18,6 +18,11 @@ answer changes, so prioritise accordingly.
 | Q18 | How do customers **obtain** releases: pull from a customer-facing registry (e.g. Artifactory with per-customer read tokens), or a signed offline bundle? | Release distribution and air-gap story (PORT-06). | **Answered:** Customers pull from a customer-facing registry we expose (PROPOSAL §2.5). |
 | Q19 | Where should the **customer-facing release registry** live: exposed on-prem Artifactory (A), ECR in a distribution account (B, recommended), or a hosted registry (C)? | Customer pull experience vs on-prem exposure (PROPOSAL §2.5). | _unanswered_ |
 | Q20 | Which **on-prem Kubernetes distributions** do customers run (RKE2/k3s, OpenShift, Tanzu, kubeadm…), and are any air-gapped? | Conformance target; offline bundle need. | _unanswered_ |
+| Q21 | Can developer laptops (via corporate VPN/Direct Connect/TGW) **reach the dev account VPC**? If not, is SSM Session Manager port forwarding allowed? | Laptop → RDS path; whether a tunnel host is needed (+1 IP). See proposal/local-development.md §5.5. | _unanswered_ |
+| Q22 | What is the **clean data DB**: a curated or synthetic reference set, or an extract of real (customer/personal) data? Who refreshes it, and how? | Whether it may be dumped to laptops to seed a local DB; the dev-reset job. | _unanswered_ |
+| Q23 | Does our **managed Windows build** allow WSL2 (Hyper-V platform), systemd in WSL, and rootless Podman? Any endpoint-security exclusions needed? | Viability of the whole local workflow; fallback to hosted dev envs. | _unanswered_ |
+| Q24 | Do laptops need a **corporate proxy and/or internal CA** to reach Artifactory and AWS? | Bootstrap script and the `dev` image stage. | _unanswered_ |
+| Q25 | Is the shared dev RDS the **same database the dev EKS environment uses**, or a separate one for laptops? | Blast radius of laptop activity; reset schedule. | _unanswered_ |
 
 ## Medium impact
 
