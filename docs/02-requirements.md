@@ -39,7 +39,7 @@ written reason to omit. **MAY** = nice to have; don't build it unless it's free.
 | ID | Requirement | Pri | Verification |
 |---|---|---|---|
 | ZDT-01 | A normal release causes **zero failed user requests** (5xx or connection errors attributable to the release). | MUST | Load test at representative RPS during release; error count = 0. |
-| ZDT-02 | Rollback to the previous release completes in ≤ 5 minutes and is a single, rehearsed command or approval. | MUST | Timed rollback drill each quarter. |
+| ZDT-02 | Rollback to the previous release has **zero downtime**, completes in ≤ 5 minutes, and is a single, rehearsed command or approval. | MUST | Timed rollback drill under load each quarter: 0 failed requests. |
 | ZDT-03 | A failed health check during release aborts automatically and leaves (or returns) traffic on the previous version. | MUST | Fault-injection test with a deliberately broken release. |
 | ZDT-04 | The proposal decides **rolling vs blue/green** explicitly, with reasons. If blue/green, it states whether the switch is **per service or whole stack**, based on how coupled the services are (see open questions). | MUST | ADR. |
 | ZDT-05 | Database/schema changes follow expand/contract. Release N must run against schema N-1 and N+1 against N. | MUST | Migration CI test: old app on new schema. |
@@ -77,6 +77,8 @@ written reason to omit. **MAY** = nice to have; don't build it unless it's free.
 | PORT-04 | Traffic exposure supports Gateway API, with a plain `Service`/Ingress fallback documented. | SHOULD | Conformance on ≥ 2 Gateway implementations. |
 | PORT-05 | Customer install and upgrade docs, prerequisites (K8s versions, CPU/mem/storage, network) and a compatibility matrix ship with every release. | MUST | Docs generated/checked in the release workflow. |
 | PORT-06 | Air-gapped/private-registry install is possible (images and chart can be mirrored; registry is configurable). | SHOULD | Install from a mirrored registry. |
+| PORT-07 | The application has **no hard dependency on any cloud's managed services**. Every such integration (load balancer, certificates, secrets store, telemetry backend, database) is an optional adapter selected by values. | MUST | Install and upgrade with all AWS adapters disabled. |
+| PORT-08 | A customer's plain `helm upgrade` (or their own GitOps tool) performs a **zero-downtime rolling upgrade** on any conformant Kubernetes, with no tooling from us. The zero-downtime behaviour lives in the chart and app, not in our pipeline. | MUST | Conformance: load test during `helm upgrade` on kind and a non-AWS distro; 0 failed requests. |
 
 ## SEC: Security and compliance
 
@@ -93,7 +95,7 @@ written reason to omit. **MAY** = nice to have; don't build it unless it's free.
 | ID | Requirement | Pri | Verification |
 |---|---|---|---|
 | OBS-01 | The app emits standard telemetry: Prometheus-format metrics and/or OTLP, structured JSON logs to stdout, health endpoints. Sinks are environment choices. | MUST | Contract test. |
-| OBS-02 | Internal environments use **managed** backends (e.g. CloudWatch / Container Insights, Amazon Managed Prometheus with agentless scraper, Managed Grafana) in preference to self-hosted in-cluster stacks. | SHOULD | Pod inventory. |
+| OBS-02 | Each environment ships telemetry to the backend its platform already provides (e.g. CloudWatch/AMP on AWS, Cloud Logging/GMP on GCP, SLS/ARMS on Alibaba, the customer's stack on-prem) in preference to a self-hosted in-cluster stack. The app and chart are backend-agnostic (OTLP, PromQL-compatible metrics, stdout logs). | SHOULD | Pod inventory; adapter config per platform. |
 | OBS-03 | Release health signals (error rate, latency, readiness) are available to the deploy gate in ZDT-03. | MUST | Gate reads them. |
 | OBS-04 | In-cluster observability footprint is ≤ 1 DaemonSet + ≤ 2 Deployments, or 0 on Fargate. | SHOULD | Pod inventory. |
 

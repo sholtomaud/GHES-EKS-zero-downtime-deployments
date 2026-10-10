@@ -39,7 +39,7 @@ flowchart LR
 | D. Argo CD Core (slimmed) | Keep Argo CD without UI/Dex/notifications. | 3–4 | Familiar to the team. | Still the heaviest. The main problem was the stack around it, not just Argo. |
 | E. Keep current platform | — | many | No migration. | Fails NET-01/02. |
 
-**Reviewer's lean:** A or C. A if the organisation values AWS-native audit and
+**Update:** PROPOSAL.md v3 chooses **A (CodePipeline + in-VPC CodeBuild)** for our own AWS accounts, which is the only place we run CI/CD. Customers deploy with their own tooling, so D2 doesn't apply to them; portability is handled in the chart [PORT-07, PORT-08].
 wants zero resident pods. C if pull-based security and drift correction are
 valued, and 2–3 pods are affordable (they are, with secondary CIDR). B is
 attractive for its simplicity, but the network path and the CI-holds-prod-keys

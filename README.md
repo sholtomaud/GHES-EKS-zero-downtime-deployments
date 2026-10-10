@@ -1,5 +1,8 @@
 # GHES → Artifactory → EKS: lean, zero-downtime delivery
 
+> **Start here: [PROPOSAL.md](PROPOSAL.md)**, the recommended design in one
+> document. Everything else in this repo is supporting detail.
+
 This repository is the **requirements and decision pack** for replacing our
 current deployment platform (Argo CD + Actions Runner Controller + in-cluster
 Prometheus stack + many add-ons) with something proportionate to what we
