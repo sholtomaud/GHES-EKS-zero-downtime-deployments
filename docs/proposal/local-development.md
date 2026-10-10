@@ -1,6 +1,13 @@
 # Proposal: local development workflow
 
-**Status:** Proposed, for review  ·  **Date:** 2026-10-10  ·  **ADR:** [ADR-0003](../adr/0003-local-development-workflow.md)
+**Status:** Proposed, for review (rev 2)  ·  **Date:** 2026-10-10  ·  **ADR:** [ADR-0003](../adr/0003-local-development-workflow.md)
+
+> **Rev 2 incorporates answers to Q21–Q25.** Laptops already route to the dev
+> VPC, so they connect **directly on 5432, through a narrowly scoped security
+> group rule** (§5.5), and the SSM tunnel is dropped. **Clean holds real
+> data:** laptops may *query* it, as named people only, and never copy it
+> (§5.1, §5.4). So dev is **no longer reset from clean** (Q26). No corporate
+> CA or proxy is needed. Dev is shared with the dev EKS environment.
 
 How a developer on a Windows laptop builds and runs the `api`, `agent` and
 `frontend` containers locally in VS Code, against the shared **dev** Postgres
@@ -22,7 +29,7 @@ about is enough by itself, but each does one job well:
 | Layer | File | Job | Who uses it |
 |---|---|---|---|
 | **Runtime definition** | `compose.yaml` | The only place that says which containers run, how they're built (`target: dev`), and how they're wired | Everything below |
-| **Front door 1: `make`** | `Makefile` | The single, editor-neutral entry point: `make dev`, `make db-tunnel`, `make test`. CI calls the same targets. | Terminal users, CI, docs |
+| **Front door 1: `make`** | `Makefile` | The single, editor-neutral entry point: `make dev`, `make db-shell`, `make test`. CI calls the same targets. | Terminal users, CI, docs |
 | **Front door 2: Dev Container** | `.devcontainer/devcontainer.json` | A pinned toolchain (language runtimes, `aws`, `psql`, `helm`, linters) with no local installs. It's built on the same `compose.yaml`. | VS Code users (the default) |
 | **Front door 3: VS Code tasks** | `.vscode/tasks.json`, `launch.json` | Buttons and debugger attach. Each task is a **one-line call to a `make` target**, with no logic of its own. | VS Code users |
 
@@ -34,9 +41,10 @@ The recommended setup on each laptop:
 - **The repo cloned inside the WSL filesystem** (`~/src/...`), never under `/mnt/c`.
 
 Developers are pushed toward the dev database because it's the zero-config
-default (`make dev` ⇒ `DB=dev`). The clean database is read-only to laptops.
-The only target where local code may run migrations is a throwaway local
-Postgres.
+default (`make dev` ⇒ `DB=dev`). The clean database holds real data. Laptops
+can only query it, read-only, through each person's own login, and it's never
+copied off RDS. The only target where local code may run migrations is a
+throwaway local Postgres.
 
 ```mermaid
 flowchart LR
@@ -49,16 +57,17 @@ flowchart LR
       compose --> agent[agent<br/>hot reload]
       compose --> fe[frontend :5173<br/>dev server]
       compose -. DB=local .-> pg[(postgres<br/>ephemeral)]
-      tun[make db-tunnel<br/>SSM port-forward]
+      shell[make db-shell<br/>psql as you, IAM token]
     end
     vsc --- ws
   end
   subgraph aws[Dev AWS account]
-    dev[(RDS dev<br/>shared · read/write DML)]
-    clean[(RDS clean<br/>golden · read-only)]
+    sg{{SG: tcp/5432 from<br/>laptop/VPN prefix list only<br/>TLS required}}
+    dev[(RDS dev<br/>shared with dev EKS<br/>DML only from laptops)]
+    clean[(RDS clean<br/>real data · query only<br/>named IAM logins)]
   end
-  api & agent -->|DB=dev default| tun --> dev
-  api & agent -. DB=clean .-> tun -.-> clean
+  api & agent -->|DB=dev default<br/>corporate route| sg --> dev
+  shell -.->|DB=clean| sg -.-> clean
   art[(Artifactory<br/>base images, released<br/>images by digest)] --> compose
 ```
 
@@ -138,7 +147,8 @@ built to allow that, since `make dev` works without it.
 | Source location | **Inside the WSL filesystem** (`~/src/<repo>`) | Bind mounts from `/mnt/c` are slow, and file watchers (hot reload) don't get inotify events across the 9P boundary. |
 | Line endings | `.gitattributes`: `* text=auto eol=lf` | Avoids CRLF-broken shell scripts and Dockerfiles from Windows-side git |
 | Resources | `.wslconfig` documented: e.g. `memory=8GB`, `processors=4` | WSL2 otherwise grows to take half of RAM by default |
-| Corporate CA / proxy | The onboarding script installs the internal CA into WSL **and** bakes it into the `dev` image stage | Artifactory is on-prem with (probably) an internal CA. This is the most common day-one failure. Q24. |
+| WSL networking with the corporate VPN | `.wslconfig` `networkingMode=mirrored` if VPN routes or DNS don't reach WSL in default NAT mode *(verify on our Windows build)* | Laptops reach the dev VPC over the corporate route (Q21). Some VPN clients don't pass that route into WSL2's NAT network, so slice 1 must test it. |
+| Corporate CA / proxy | **Not needed** (Q24) | Laptops reach Artifactory directly. The `dev` image stage only adds the public **RDS CA bundle**, for `sslmode=verify-full`. |
 
 **Rootless UID mapping.** Bind-mounted source must stay owned by the developer,
 not by a subuid. Use `userns_mode: keep-id` in compose for source-mounting
@@ -172,8 +182,9 @@ app/
 │   ├── agent/Dockerfile
 │   └── frontend/Dockerfile
 └── scripts/dev/
-    ├── bootstrap-wsl.sh          # one-time: podman, compose, CA, systemd, aws cli, ssm plugin
-    └── db-creds.sh               # fetch dev DB secret → .dev/secrets (tmpfs-like, 0600)
+    ├── bootstrap-wsl.sh          # one-time: podman, compose, systemd, aws cli, RDS CA bundle
+    ├── db-creds.sh               # fetch dev DB secret → .dev/secrets (0600)
+    └── fixtures/                 # synthetic seed data for DB=local and the dev reset
 ```
 
 **The same Dockerfiles as the release [DEV-02].** Each service Dockerfile has a
@@ -199,17 +210,16 @@ as every environment (AGENTS.md rule 7) [DEV-02].
 | Target | Does | Notes |
 |---|---|---|
 | `make bootstrap` | One-time WSL setup (`scripts/dev/bootstrap-wsl.sh`). Idempotent. | Checks repo isn't under `/mnt/c`, and that systemd and the Podman socket are running |
-| `make dev` | `db-creds` → `db-tunnel` (background) → `compose up --build` | `DB=dev` by default; prints a banner with the DB target |
-| `make dev DB=clean` | Same, read-only credentials for the clean DB | For reproducing a bug against known data |
-| `make dev DB=local` | Starts ephemeral Postgres, seeds it, **runs migrations** | The only target where local code runs DDL |
-| `make db-tunnel` | SSM port-forward to the chosen RDS on `localhost:15432` | Not needed if the corporate network routes to the VPC (Q21) |
-| `make db-shell` | `psql` as **you** (IAM auth token), against the current `DB` | Attributable, short-lived |
+| `make dev` | `db-creds` → `compose up --build` | `DB=dev` by default; prints a banner with the DB target |
+| `make dev DB=local` | Starts ephemeral Postgres, seeds it from `fixtures/`, **runs migrations** | The only target where local code runs DDL |
+| `make db-shell` | `psql` as **you** (IAM auth token) against dev | Attributable, short-lived |
+| `make db-shell DB=clean` | `psql` as **you** (IAM auth token), read-only, against clean | The only laptop path to clean. Query only (§5.4). |
 | `make down` / `make clean` | Stop / remove containers and volumes | `clean` also deletes `.dev/` |
 | `make test`, `make lint` | The same commands CI runs, in the workspace container | Same versions as CI |
 | `make pin-release VERSION=x` | Write released image digests into `.env` | Used with `SRC=` |
 | `make help` | Lists targets | The default target |
 
-VS Code `tasks.json` exposes `dev`, `dev: local db`, `down`, `test`, `db-shell`.
+VS Code `tasks.json` exposes `dev`, `dev: local db`, `down`, `test`, `db-shell`, `db-shell: clean`.
 Each one is `"command": "make <target>"`.
 
 ### Dev Container shape
@@ -240,37 +250,34 @@ else changes.
 
 ---
 
-## 5. Databases: dev by default, clean read-only, local for schema work
+## 5. Databases: dev by default, clean query-only, local for schema work
 
 ### 5.1 The three targets
 
-| `DB=` | Where | Laptop role | Can run DDL? | Default? | Use for |
+| `DB=` | Where | Laptop access | Can run DDL? | Default? | Use for |
 |---|---|---|---|---|---|
-| **`dev`** | RDS, dev account; also used by the dev EKS environment | `app_dev_local`: DML only (SELECT/INSERT/UPDATE/DELETE) | **No** | **Yes** | Everyday feature work against realistic, shared data |
-| `clean` | RDS, dev account | `readonly`: SELECT only | No | No | Reproducing a bug against known, stable data; diffing what dev has drifted to |
-| `local` | Podman container on the laptop, discarded on `make down` | Owner | **Yes** | No | Writing and testing migrations; destructive experiments; working offline |
-
-*Assumption:* "clean data DB" means a **golden reference dataset** whose schema
-tracks the latest release. It's refreshed only by a controlled job, and is used
-to reset dev. If it's actually something else (for example, a prod extract with
-real customer data), §5.3 changes: see Q22.
+| **`dev`** | RDS, dev account. **Shared with the dev EKS environment** (Q25). | App containers: `app_dev_local`, DML only. People: own IAM login, DML only. | **No** | **Yes** | Everyday feature work |
+| `clean` | RDS, dev account. **Real data** (Q22). | **People only**, each with their own IAM login mapped to `clean_reader` (SELECT only). No app containers, no shared credential. | No | No | Querying real data to understand a bug or check an assumption |
+| `local` | Podman container on the laptop, discarded on `make down` | Owner | **Yes** | No | Writing and testing migrations, destructive experiments, working offline |
 
 ### 5.2 How developers are pushed toward dev [DEV-03]
 
 1. **It's the default.** `make dev` with no arguments uses dev. Nothing to
    configure apart from `aws sso login`.
-2. **Clean is useless for writing.** Laptop credentials for clean are
-   SELECT-only, so no one "temporarily" points at it to get unstuck and then
-   corrupts it.
+2. **Clean isn't a place to run the app.** The local stack can't target it at
+   all. Clean can only be queried by a named person, read-only.
 3. **Every start shows the target.** `make dev` prints
-   `DB: dev (shared, rds-dev.xxxx:5432 via tunnel)` and the frontend shows a
+   `DB: dev (shared with dev EKS, rds-dev.xxxx:5432)` and the frontend shows a
    corner badge in dev mode. Nobody is unsure which database they're on.
 4. **The migration path goes through local, by design.** Schema changes need
    `DB=local`, so dev is never the place to try a migration.
-5. **Dev is kept useful.** A scheduled job **resets dev from clean** (e.g.
-   weekly, or on demand via a GHES workflow), then re-applies pending
-   migrations from `main`. A shared DB that slowly fills with junk drives
-   people away from it. A predictable reset keeps them on it.
+5. **Dev is kept useful.** A scheduled job **resets dev from the synthetic
+   fixture set** (e.g. weekly, or on demand via a GHES workflow), then
+   re-applies migrations from `main`. A shared DB that slowly fills with junk
+   drives people away from it. A predictable reset keeps them on it.
+   **The reset doesn't copy from clean:** that would put real data into a
+   writable database that every laptop reaches with a shared credential. Q26
+   asks whether a *masked* copy of clean is wanted instead.
 
 ### 5.3 Why laptops must not run migrations against shared dev [DEV-04]
 
@@ -278,7 +285,7 @@ Dev is shared by every developer **and** the dev EKS environment. One branch's
 unmerged migration would break everyone else, and the dev deploy pipeline would
 later fail on a schema it didn't create. So:
 
-- **DDL rights aren't granted to the laptop role.** That's enforced by
+- **DDL rights aren't granted to any laptop role.** That's enforced by
   Postgres grants, not by a rule people have to remember.
 - **Migrations reach dev only through the pipeline**: the expand-only migration
   Job in PROPOSAL.md §3.3, run when `main` deploys to dev.
@@ -286,41 +293,63 @@ later fail on a schema it didn't create. So:
   requires release N to run on schema N-1 and N+1. The same rule means branch
   code runs against `main`'s schema. A local stack that breaks on dev's schema
   is an early warning of a migration that would break zero-downtime rollback.
-- **Local DB seed:** from a **synthetic fixture set** checked into the repo, or
-  from a `pg_dump` of clean **only if** clean holds no customer/personal data
-  (Q22). Seeding is `make dev DB=local`, and takes a few seconds for a fixture
-  set.
+- **Local DB seed:** from the **synthetic fixture set** checked into the repo,
+  never from clean (Q22). Seeding is `make dev DB=local` and takes seconds.
 
-### 5.4 Credentials [DEV-06]
+### 5.4 Credentials and clean-data controls [DEV-06, DEV-08]
 
-| Who | How | Lifetime | Stored |
+| Who | Target | How | Stored |
 |---|---|---|---|
-| Developer (human, `psql`, GUI) | **RDS IAM database authentication**: `aws sso login`, then a token from `aws rds generate-db-auth-token`. Each dev has a Postgres login mapped to the `rds_iam` role. | Token valid 15 min for *connecting*; the session lasts beyond it | Nowhere: generated per connection |
-| Local app containers (`api`, `agent`) | `app_dev_local` (or `readonly` for clean) password from **Secrets Manager**, fetched by `make db-creds` using your SSO session | Rotated (e.g. 30 days) | `.dev/secrets/db.env`, mode 0600, gitignored, injected as env/file exactly as the K8s Secret is in clusters |
+| People (`psql`, GUI client) | dev, clean | **RDS IAM database authentication**: `aws sso login`, then `make db-shell` generates a token (valid 15 min for *connecting*; the session outlives it). One Postgres login per person, granted `rds_iam`. | Nowhere: generated per connection |
+| Local app containers (`api`, `agent`) | dev only | `app_dev_local` password from **Secrets Manager**, fetched by `make db-creds` using your SSO session; rotated | `.dev/secrets/db.env`, mode 0600, gitignored, injected as env/file exactly as the K8s Secret is in clusters |
+
+**Clean is query-only, not copy.** Postgres can't technically stop someone who
+can `SELECT` from saving the result. So the controls are about making that
+deliberate, attributable and visible, not impossible:
+
+| Control | How |
+|---|---|
+| Attributable | **IAM authentication only** on clean: no password logins, no shared role. Every session is a named person. |
+| Least privilege | `clean_reader`: `SELECT` on application schemas only. No `CREATE`, no `TEMP`, no `pg_read_server_files`. |
+| Audited | **`pgaudit`** with `pgaudit.log = 'read'` for `clean_reader`, plus `log_connections`, shipped to CloudWatch Logs with retention set by the data owner *(verify pgaudit settings on our RDS Postgres version)*. |
+| Bounded | `statement_timeout` (e.g. 60 s) and `idle_in_transaction_session_timeout` on the role. That stops accidental full-table pulls and long-held snapshots. |
+| No bulk paths | No `make` target or script dumps clean. The onboarding doc states the rule: **query, don't copy**. Results go nowhere outside the client session. |
+| Who | Access to clean is a **separate SSO permission set** ("CleanDataReader") from dev access, so it can be granted to fewer people and reviewed. |
 
 - **Why not IAM auth for the app containers too?** A pooled app needs a token
   refresh hook when it reconnects after 15 minutes. If the app doesn't already
   support that, a static role password delivered the way the cluster delivers
   it (a Secret → env/file, PROPOSAL.md §2.2) keeps the app's code path
-  identical everywhere. If the app gains IAM auth for prod (SEC-05), switch
-  local over too.
+  identical everywhere. That's acceptable for dev because dev holds synthetic
+  data only. If the app gains IAM auth for prod (SEC-05), switch local over too.
 - **No credentials in Git or images** [SEC-02]. `.dev/` and `.env` are
   gitignored, and secret scanning runs in CI.
-- Access is granted via an **SSO permission set** "DevDatabaseAccess". It
-  allows `rds-db:connect` to the dev users, `secretsmanager:GetSecretValue` on
-  the two laptop secrets, and SSM port forwarding to the tunnel host. Nothing
-  else in the dev account.
+- **Permission sets:** "DevDatabaseAccess" allows `rds-db:connect` to your dev
+  user and `secretsmanager:GetSecretValue` on the one laptop secret.
+  "CleanDataReader" allows `rds-db:connect` to your clean user only. Neither
+  allows anything else in the dev account.
 
-### 5.5 Network path from laptop to RDS
+### 5.5 Network path: yes, open 5432, but only this narrowly (Q21)
 
-RDS stays private. Not publicly accessible. Ever.
+Laptops already route to the dev VPC, so a tunnel adds nothing. Open the port,
+scoped like this:
 
-| Option | Extra IPs (dev account) | Cost | Verdict |
-|---|---|---|---|
-| **Existing corporate route** (VPN / Direct Connect / TGW from on-prem to the dev VPC) | 0 | 0 | **Use if it exists** (Q21) |
-| **SSM Session Manager port forwarding** (`AWS-StartPortForwardingSessionToRemoteHost`) via one small EC2 instance with no inbound rules | 1 (+ SSM VPC endpoints if the subnet has no NAT; endpoints aren't budgeted, per Q14) | ~a few US$/month (t4g.nano) | **Recommended otherwise.** IAM-controlled, CloudTrail-logged, no open ports. Needs the Session Manager plugin in WSL. |
-| AWS Client VPN | 1 ENI per associated subnet | Hourly per association + per connection | Heavier than needed for one DB port |
-| Public RDS + IP allow-list | 0 | 0 | **Rejected.** Exposes the DB to the internet. |
+| Control | Setting | Why |
+|---|---|---|
+| Source | **A managed prefix list of laptop / VPN client CIDRs only.** Not the whole on-prem range, and not server or datacentre subnets. The prefix list is in IaC. | The DB port is reachable from developer machines, not from every system on the corporate network |
+| Destination | **One security group per RDS instance** (dev, clean), each with only the `tcp/5432` rule from that list. Separate from the rule that lets dev EKS pods in. | Laptop access can be removed or narrowed without touching the app's path. Clean can use a tighter list later if needed. |
+| Port | `5432` only. No other ingress. | |
+| Exposure | `publicly_accessible = false`, private subnets only | Reachable from the corporate route, never from the internet |
+| Transport | `rds.force_ssl = 1`; clients use `sslmode=verify-full` with the RDS CA bundle | Credentials and query results are encrypted on the corporate network too |
+| Authentication | Grants and IAM auth as in §5.4 | Reaching the port isn't access. Clean accepts IAM logins only. |
+| DNS | Use the RDS endpoint name. For a non-public instance it resolves to the private IP *(verify from a laptop on the VPN)*. | No hosts-file hacks. Failover keeps working. |
+
+**Rejected:**
+- **SSM port forwarding** isn't needed now there's a route. It costs a host and
+  1 IP. It stays the fallback for anyone off the corporate network.
+- **Opening 5432 to the whole private range** means every on-prem server and
+  any compromised host can reach the DB port.
+- **Public RDS:** the DB would be on the internet.
 
 ---
 
@@ -333,8 +362,8 @@ account gains:
 |---|---|---|
 | RDS dev (single-AZ) | 1 | Multi-AZ would add a standby ENI |
 | RDS clean (single-AZ) | 1 | |
-| SSM tunnel host (only if no corporate route) | 1 | |
-| **Total added** | **2–3** | Dev minimal peak goes from ~33 (PROPOSAL.md §3.6) to ~36. Still ≤ 50 [NET-01]. |
+| Laptop access (direct route, §5.5) | 0 | SG rules and a prefix list use no IPs |
+| **Total added** | **2** | Dev minimal peak goes from ~33 (PROPOSAL.md §3.6) to ~35. Still ≤ 50 [NET-01]. |
 
 **Gap found:** PROPOSAL.md §3.6 doesn't count **RDS ENIs** in any environment.
 That should be fixed in the main budget (+1 per single-AZ instance, +2 for
@@ -349,10 +378,11 @@ Multi-AZ). It doesn't change the verdict for any profile.
 | DEV-01 One documented entry point | `make dev`; tasks and Dev Container call it | New-starter exercise: README only |
 | DEV-02 Same Dockerfiles; non-edited services by digest | `dev` stage of each service Dockerfile; `make pin-release` | CI builds `dev` and `runtime` from the same file; lint rejects `:latest` in compose |
 | DEV-03 Dev DB is the default | `DB ?= dev` in Makefile; banner | `make dev` with an empty `.env` connects to dev |
-| DEV-04 No laptop DDL on shared DBs | Postgres grants on `app_dev_local` and `readonly` | Test: `CREATE TABLE` as the laptop role fails on dev and clean |
+| DEV-04 No laptop DDL on shared DBs | Postgres grants on `app_dev_local`, personal dev logins, `clean_reader` | Test: `CREATE TABLE` as each laptop role fails on dev and clean |
 | DEV-05 Clone to running stack < 1 h on Windows | `make bootstrap`, Dev Container | Timed onboarding of a new team member |
 | DEV-06 No long-lived DB creds on laptops for humans; none in Git | IAM DB auth; Secrets Manager fetch; `.gitignore` | IAM review; secret scanning |
 | DEV-07 No paid container-desktop licence required | Podman rootless | Onboarding doc lists no paid tool |
+| DEV-08 Clean data is query-only from laptops: named, read-only, audited, never copied | IAM-only logins, `clean_reader`, pgaudit, no dump tooling, synthetic seeds (§5.4) | Password login to clean fails; a `SELECT` appears in the audit log under a person's name; repo contains no dump of clean |
 
 ---
 
@@ -360,19 +390,23 @@ Multi-AZ). It doesn't change the verdict for any profile.
 
 | # | Assumption | If wrong | Q |
 |---|---|---|---|
-| R1 | Laptops can reach the dev VPC (corp route), or SSM port forwarding is allowed | Use Client VPN, or a hosted dev env (option F) | Q21 |
-| R2 | Clean holds no customer/personal data | Seed local from synthetic fixtures only. Clean stays reachable read-only through the tunnel, never dumped to laptops. | Q22 |
-| R3 | WSL2 + rootless Podman + Dev Containers works on our managed Windows build (endpoint security, proxy, Hyper-V policy) | Slice 1 will show it. Fallback: option A for toolchain, then option F if WSL itself is blocked. | Q23 |
-| R4 | Internal CA / proxy can be trusted inside WSL and containers | Artifactory pulls fail on day one. The bootstrap script must handle it. | Q24 |
+| R1 | ~~Laptops can reach the dev VPC~~ **Confirmed** (Q21). Remaining: the VPN route also reaches *inside WSL2* | `networkingMode=mirrored`; failing that, SSM port forwarding | Q21 |
+| R2 | **Resolved: clean holds real data** (Q22). Design changed: query-only, named and audited access; synthetic seeds; dev not reset from clean. | Q26 asks if a masked copy is wanted | Q22, Q26 |
+| R3 | WSL2 + rootless Podman + Dev Containers works on our managed Windows build (endpoint security, Hyper-V policy). **Believed yes** (Q23). | Slice 1 will show it. Fallback: option A for toolchain, then option F if WSL itself is blocked. | Q23 |
+| R4 | **Resolved:** no corporate CA or proxy needed (Q24) | — | Q24 |
 | R5 | The app reads DB settings from env/file (hosting contract §2.2), so local and cluster delivery are identical | Small app change, needed for portability anyway | Q7 |
 | R6 | Branch code tolerates `main`'s schema (expand/contract) | That's a ZDT-05 violation, which the local stack exposes early. That's a feature. | — |
-| R7 | Dev being shared with the dev EKS environment is acceptable | Give laptops their own `dev_shared` database on the same instance, reset from clean on the same schedule | Q25 |
+| R7 | **Believed shared** with dev EKS (Q25). Laptop writes land in the dev environment's data, which is fine for synthetic data. | If laptop activity disrupts dev-env testing, give laptops their own database on the same instance, reset from fixtures on the same schedule. | Q25 |
+| R8 | The application owner approves named, audited, read-only laptop access to real data in clean | If not, clean is reachable only from an in-VPC host (e.g. via SSM), never directly from laptops | Q22 |
 
 Unverified items, which slice 1 must check against current docs and cite:
 - Dev Containers' current Podman support statement.
 - Docker Desktop licence terms against our headcount and revenue.
 - GHES has no Codespaces.
 - `docker-compose` v2 against the Podman socket on the Podman version we pin.
+- WSL2 `networkingMode=mirrored` with our VPN client.
+- RDS endpoint DNS resolving to the private IP from a laptop.
+- `pgaudit` read logging on our RDS Postgres version.
 
 ---
 
@@ -380,10 +414,10 @@ Unverified items, which slice 1 must check against current docs and cite:
 
 | # | Slice | Proves | Size |
 |---|---|---|---|
-| 1 | On **one real managed Windows laptop**: WSL2 + Podman + compose + Dev Container for `api` only, with `DB=local`. Settle the keep-id/user combination and the CA install. | R3, R4, DEV-07 | 2–3 days |
-| 2 | Dev account: two RDS instances, roles and grants, the SSO permission set, Secrets Manager secrets, and (if Q21 says so) the SSM tunnel host. In IaC. | DEV-04, DEV-06, §5.5 | 2–3 days |
+| 1 | On **one real managed Windows laptop**: WSL2 + Podman + compose + Dev Container for `api` only, with `DB=local`. Settle the keep-id/user combination. **Prove the VPN route reaches RDS from inside a rootless container in WSL.** | R1, R3, DEV-07 | 2–3 days |
+| 2 | Dev account: two RDS instances, laptop prefix list + SGs, `force_ssl`, roles and grants, IAM-only clean with pgaudit, two SSO permission sets, one Secrets Manager secret. In IaC. | DEV-04, DEV-06, DEV-08, §5.5 | 3–4 days |
 | 3 | `make dev` for api + agent + frontend against dev; `pin-release`/`SRC=`; tasks.json, launch.json; banner | DEV-01/02/03 | 3–4 days |
-| 4 | Scheduled dev reset from clean + migrations from `main` (GHES workflow → CodeBuild in VPC, same pattern as deploys) | §5.2 point 5 | 2 days |
+| 4 | Synthetic fixture set + scheduled dev reset from it, then migrations from `main` (GHES workflow → CodeBuild in VPC, same pattern as deploys) | §5.2 point 5 | 3 days |
 | 5 | Timed onboarding with a new team member; fix what they hit | DEV-05 | 1 day |
 
 About **2–3 weeks** for one engineer. It can run in parallel with PROPOSAL.md

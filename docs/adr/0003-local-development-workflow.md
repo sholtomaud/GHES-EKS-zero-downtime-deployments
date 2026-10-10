@@ -3,7 +3,7 @@
 - **Status:** Proposed
 - **Date:** 2026-10-10
 - **Deciders:** <engineering lead, platform owner, a representative developer>; only humans set `Accepted`
-- **Requirements:** [DEV-01]–[DEV-07] (proposed), [ZDT-05], [SEC-02], [NET-01]
+- **Requirements:** [DEV-01]–[DEV-08] (proposed), [ZDT-05], [SEC-02], [NET-01]
 
 ## Context
 
@@ -12,7 +12,11 @@ Developers work on Windows laptops and need to run the `api`, `agent` and
 RDS in the dev account: a shared **dev** database and a **clean** reference
 database. We want developers to use dev by default. Docker Desktop needs a paid
 licence at our size. No existing requirement covers local development, so
-DEV-01..07 are proposed alongside this ADR.
+DEV-01..08 are proposed alongside this ADR.
+
+Rev 2 answers: laptops already route to the dev VPC (Q21). Clean holds real
+data, which laptops may query but not copy (Q22). No corporate CA or proxy is
+needed (Q24). Dev is shared with the dev EKS environment (Q25).
 
 Full analysis: [docs/proposal/local-development.md](../proposal/local-development.md).
 
@@ -37,10 +41,16 @@ reproducibility 15, maintenance 10, licence 5 (total /500).
 2. **`compose.yaml` is the only runtime definition.** `make dev` is the
    canonical entry point. A Dev Container built from the same compose file
    supplies the pinned toolchain. VS Code tasks only call `make` targets.
-3. Local stacks connect to the **dev RDS by default** using a DML-only role.
-   They connect to **clean read-only**. They run **migrations only against an
-   ephemeral local Postgres**. Laptops reach RDS over an existing corporate
-   route or SSM port forwarding, never a public endpoint.
+3. Local stacks connect to the **dev RDS by default** using a DML-only role,
+   and run **migrations only against an ephemeral local Postgres** seeded from
+   synthetic fixtures.
+4. **Clean (real data) is query-only from laptops.** Access is by named people
+   with IAM-only logins and a SELECT-only role, audited with pgaudit. App
+   containers never target it, and no tooling dumps it. Dev is reset from
+   synthetic fixtures, never from clean.
+5. Laptops reach RDS **directly on tcp/5432** over the corporate route. Each
+   RDS security group allows only a laptop/VPN prefix list. TLS is enforced.
+   RDS is never publicly accessible.
 
 ## Consequences
 
@@ -48,17 +58,19 @@ reproducibility 15, maintenance 10, licence 5 (total /500).
   licence. Shared dev can't be broken by a branch migration. Expand/contract
   violations show up on the laptop.
 - Negative / costs: Podman + Dev Containers on Windows is less trodden than
-  Docker Desktop, and needs a laptop spike first (slice 1). There are 2–3 extra
-  IPs in the dev account (two RDS instances, optional tunnel host). Someone owns
+  Docker Desktop, and needs a laptop spike first (slice 1). There are 2 extra
+  IPs in the dev account (two RDS instances). The DB port is reachable from
+  laptop ranges, so authentication and grants carry the access control. Someone owns
   the dev-reset job.
-- Follow-ups: add RDS ENIs to the main IP budget (PROPOSAL.md §3.6). Answer
-  Q21–Q25. Move DEV-* from proposed to the contract on acceptance.
+- Follow-ups: add RDS ENIs to the main IP budget (PROPOSAL.md §3.6). Answer Q26
+  (masked copy of clean for dev?) and Q27 (laptop CIDR ranges). Move DEV-* from proposed to the contract on acceptance.
 
 ## Verification
 
 See the traceability table in the proposal §7. Key checks: a new starter
 reaches a running stack in < 1 h on a managed Windows laptop, and `CREATE TABLE`
-as the laptop role fails on dev and clean.
+as each laptop role fails on dev and clean, a password login to clean fails, and
+a `SELECT` on clean appears in the audit log under a person's name.
 
 ## References
 

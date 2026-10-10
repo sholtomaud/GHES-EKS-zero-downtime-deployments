@@ -132,6 +132,7 @@ written reason to omit. **MAY** = nice to have; don't build it unless it's free.
 | DEV-05 | On a managed Windows laptop, clone to running stack takes ≤ 1 hour. | SHOULD | Timed onboarding with a new team member. |
 | DEV-06 | No database credentials in Git or images. Human DB access is short-lived and attributable to a person. | MUST | Secret scanning; IAM/DB role review. |
 | DEV-07 | The local workflow needs no paid container-desktop licence. | SHOULD | Onboarding doc lists no paid tool. |
+| DEV-08 | The **clean** database holds real data. From laptops it is **query-only**: named people only (no shared credential), read-only, audited, and never copied (no dumps, never used to seed local or dev databases). | MUST | Password login to clean fails; reads appear in the audit log by person; no seed or reset path reads from clean. |
 
 ---
 
