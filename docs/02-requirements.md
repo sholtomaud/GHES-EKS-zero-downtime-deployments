@@ -77,6 +77,8 @@ written reason to omit. **MAY** = nice to have; don't build it unless it's free.
 | PORT-04 | Traffic exposure supports Gateway API, with a plain `Service`/Ingress fallback documented. | SHOULD | Conformance on ≥ 2 Gateway implementations. |
 | PORT-05 | Customer install and upgrade docs, prerequisites (K8s versions, CPU/mem/storage, network) and a compatibility matrix ship with every release. | MUST | Docs generated/checked in the release workflow. |
 | PORT-06 | Air-gapped/private-registry install is possible (images and chart can be mirrored; registry is configurable). | SHOULD | Install from a mirrored registry. |
+| PORT-07 | The **delivery, zero-downtime and rollback mechanisms** used in environments *we* operate work identically on every supported platform (EKS, GKE, ACK, on-prem) without relying on any one cloud's managed services. Cloud services may only be used as optional adapters. | MUST | Same conformance suite and promotion flow pass on EKS and a non-AWS cluster. |
+| PORT-08 | The only network dependency a target environment must provide for delivery is pull access to a container registry (Artifactory or a mirror). No inbound access from our systems is required. | MUST | Network review; deploy into an environment with egress to the registry only. |
 
 ## SEC: Security and compliance
 
@@ -93,7 +95,7 @@ written reason to omit. **MAY** = nice to have; don't build it unless it's free.
 | ID | Requirement | Pri | Verification |
 |---|---|---|---|
 | OBS-01 | The app emits standard telemetry: Prometheus-format metrics and/or OTLP, structured JSON logs to stdout, health endpoints. Sinks are environment choices. | MUST | Contract test. |
-| OBS-02 | Internal environments use **managed** backends (e.g. CloudWatch / Container Insights, Amazon Managed Prometheus with agentless scraper, Managed Grafana) in preference to self-hosted in-cluster stacks. | SHOULD | Pod inventory. |
+| OBS-02 | Each environment ships telemetry to the backend its platform already provides (e.g. CloudWatch/AMP on AWS, Cloud Logging/GMP on GCP, SLS/ARMS on Alibaba, the customer's stack on-prem) in preference to a self-hosted in-cluster stack. The app and chart are backend-agnostic (OTLP, PromQL-compatible metrics, stdout logs). | SHOULD | Pod inventory; adapter config per platform. |
 | OBS-03 | Release health signals (error rate, latency, readiness) are available to the deploy gate in ZDT-03. | MUST | Gate reads them. |
 | OBS-04 | In-cluster observability footprint is ≤ 1 DaemonSet + ≤ 2 Deployments, or 0 on Fargate. | SHOULD | Pod inventory. |
 

@@ -14,12 +14,12 @@ answer changes, so prioritise accordingly.
 | Q5 | Where is **Artifactory** hosted (SaaS, on-prem, in AWS)? Can AWS accounts and customer clusters reach it privately? Does it proxy public registries? | Image pull path, CodePipeline egress, air-gap story. | _unanswered_ |
 | Q6 | What exactly runs today? Confirm **ARC = Actions Runner Controller** and that runners run in workload clusters. Full list of add-ons per cluster. | Phase 0 baseline and the size of the win. | _unanswered_ |
 | Q7 | What **stateful dependencies** exist (RDS/Postgres, Redis, queues, object storage)? Managed in our accounts, and what do customers provide? | Migration (ZDT-05), portability adapters, storage on Fargate. | _unanswered_ |
+| Q8 | Do we **operate** deployments in customer environments (any cloud/on-prem), or do customers always self-install? | Decides where our delivery mechanism (Flux) must run; see PROPOSAL.md R1. | _unanswered_ |
 
 ## Medium impact
 
 | # | Question | Impact | Answer |
 |---|---|---|---|
-| Q8 | Do we ever **operate** deployments in customer accounts, or do customers always self-install? | Whether our delivery mechanism must span customer accounts. | _unanswered_ |
 | Q9 | Which customer platforms are **committed** vs hypothetical (GKE, Alibaba ACK, on-prem distro names/versions)? Any customers without Kubernetes? | PORT-02 test matrix. | _unanswered_ |
 | Q10 | Compliance regimes (e.g. ISO 27001, SOC 2, IRAP, government)? Who must approve prod releases? | DEP-02 approval design, audit retention, signing. | _unanswered_ |
 | Q11 | Availability target / SLO and acceptable maintenance windows? | Profiles, multi-AZ, ZDT strictness. | _unanswered_ |

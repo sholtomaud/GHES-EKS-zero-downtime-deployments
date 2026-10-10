@@ -1,390 +1,351 @@
-# Proposal: a lean, zero-downtime delivery platform for 2026
+# Proposal: lean, portable, zero-downtime delivery (v2)
 
 **Status:** Proposed, for review  ·  **Date:** 2026-10-10
 
-This is the recommended design. It's meant to be read on its own; the rest of
-the repo (requirements, IP model, options, open questions) is supporting detail.
+This is the recommended design, written to be read on its own. The rest of the
+repo (requirements, IP model, options, open questions) is supporting detail.
+
+> **What changed from v1.** v1 made the *artefact* portable but relied on AWS
+> for *how it's deployed, switched and monitored* (CodePipeline, ALB weights,
+> CloudWatch gates). That fails the brief: we run the product for different
+> customers on EKS, GKE, Alibaba Cloud and on-prem, and many of those places
+> have no AWS services. v2 makes the **delivery and zero-downtime mechanisms
+> identical on every platform**. AWS, GCP, Alibaba and on-prem services become
+> interchangeable **adapters** behind a small contract.
 
 ---
 
 ## 1. The answer in one page
 
-**Keep** GHES, Artifactory and EKS. **Remove** Argo CD, ARC, the in-cluster
-Prometheus stack, cert-manager, external-dns and the other add-ons. **Replace**
-them with this:
+Split the system into three layers and only allow platform-specific choices in
+the bottom one.
 
-1. **One release artefact.** GHES Actions builds the 8 images once, signs them,
-   and publishes **one OCI Helm chart** to Artifactory that pins all 8 image
-   digests. That chart, plus a small `deploy.sh`, *is the product*. Customers get
-   exactly the same thing.
-2. **Push-based delivery, AWS-native, no controller in the cluster.** Promoting a
-   release in GHES (with approval for prod) calls **CodePipeline** in the target
-   account. CodePipeline runs **one CodeBuild step inside the VPC** that executes
-   the release's own `deploy.sh`. That is the same script a customer would run.
-3. **Blue/green at whole-stack level on one shared ALB.** The new version comes up
-   in the idle colour's namespace, gets smoke-tested on a preview hostname, then
-   ALB weights move traffic 10% → 100% while ALB 5xx metrics are watched.
-   Anything wrong flips the weights back in seconds. The old colour is scaled to
-   zero after a hold window.
-4. **EKS Auto Mode, with pods on a secondary non-routable CIDR.** AWS runs the
-   nodes, CNI, load balancing, storage and DNS. Pod IPs come from `100.64.0.0/16`,
-   not from your scarce routable range.
-5. **Managed everything else.** ACM for TLS, Route 53 records in IaC, CloudWatch
-   ALB metrics for the release gate, CloudWatch/AMP for telemetry, Secrets Manager
-   for secrets. Humans get read-only cluster access, and a nightly job detects drift.
+| Layer | What it is | Same everywhere? |
+|---|---|---|
+| **1. Product** | 8 images + one signed OCI Helm chart, with zero-downtime behaviour built into the app and chart | **Identical** |
+| **2. Delivery** | A tiny pull-based reconciler (Flux: 2 pods) that pulls the approved release from a registry and performs a health-gated rolling upgrade with automatic rollback | **Identical** wherever we operate. Customers may swap in their own tool. |
+| **3. Environment adapters** | Load balancer/Gateway, TLS, DNS, secrets store, telemetry backend, IP strategy, database | **Differs per platform**, chosen by Helm values |
 
-**Effect on IP addresses** (minimal profile, during a blue/green release):
+**Zero downtime** comes from Kubernetes-native **rolling updates done
+properly** (they work on any conformant cluster) plus application rules for
+graceful shutdown, version compatibility and database migrations. **Blue/green
+or canary is an optional add-on** for environments that need instant switch-back.
+It uses the portable **Gateway API**, so it isn't tied to any cloud's load balancer.
 
-| | Today | Proposed | Fallback if no secondary CIDR (Fargate) |
-|---|---|---|---|
-| Routable VPC IPs | ~130 | **~16** (+ local VPC endpoints, if any) | ~35 |
-| In-cluster platform controllers we operate | ~15+ | **0** | 2 (CoreDNS, LB controller) |
-| Fits an 80-IP account? | No | **Yes, with > 75% headroom** | Yes, with ~40% headroom |
-
-Estimates, not measurements; §8 shows the arithmetic. Phase 0 will measure today's
-actual breakdown.
+The **only network path every environment must have is to a container
+registry**: Artifactory, or the customer's mirror of it. That's what makes pull
+the right model. Nothing needs to reach *into* a customer environment, and no
+deploy credentials leave it.
 
 ```mermaid
-flowchart LR
-  dev[Developer] -->|PR / merge| ghes[GHES Actions<br/>build · test · sign]
-  ghes -->|images + OCI chart<br/>by digest| art[(Artifactory)]
-  ghes -->|promote vX.Y.Z<br/>prod needs approval| cp[CodePipeline<br/>per account]
-  cp --> cb[CodeBuild in VPC<br/>runs release's deploy.sh]
-  cb -->|helm, by digest| eks[EKS Auto Mode]
-  art -. pull images/chart .-> eks
-  art -. pull chart .-> cb
-  cb -->|shift weights| alb[Shared ALB<br/>blue ⇄ green]
-  alb --> eks
-  cust[Customer] -->|same chart + deploy.sh| theirk8s[Their Kubernetes<br/>EKS · GKE · ACK · on-prem]
-  art -. pull .-> cust
+flowchart TB
+  subgraph build[Our build system, fixed]
+    ghes[GHES Actions<br/>build · test · sign · conformance] --> art[(Artifactory<br/>images + chart + channels)]
+    promote[GHES promote workflow<br/>approval per environment] -->|move channel to signed release| art
+  end
+  subgraph envs[Any environment]
+    direction LR
+    subgraph aws[Our AWS accounts]
+      f1[Flux] --> a1[App]
+    end
+    subgraph gcp[Customer on GKE]
+      f2[Flux] --> a2[App]
+    end
+    subgraph onp[Customer on-prem]
+      mirror[(Their registry mirror)] --> f3[Flux or their own tool] --> a3[App]
+    end
+  end
+  art -. pull .-> f1
+  art -. pull .-> f2
+  art -. mirror .-> mirror
 ```
 
 ---
 
-## 2. Why this design
+## 2. Zero downtime, portably
 
-| Principle | How the design applies it |
-|---|---|
-| **The product is the release artefact** (ADR-0002) | Our pipeline runs the customer's install script. If it works for us, it works for them, and it's tested on every release. |
-| **No resident machinery we don't need** | Production changes only through authorised releases, so continuous reconciliation buys little. Prevention (read-only humans) plus nightly detection covers drift at zero pods. |
-| **The IP problem is a compute and CNI problem** | The deploy tool barely affects IP count. Platform pods, warm pools and pod-IP placement do. Auto Mode plus a secondary CIDR fixes it structurally. |
-| **Zero downtime is designed in, not bolted on** | Readiness gates, drain timings, expand/contract migrations and an ALB-metric gate. A rollout controller doesn't replace any of these. |
-| **Boring, managed, auditable** | CodePipeline, CodeBuild, IAM, CloudTrail and the ALB are all AWS-managed with nothing to upgrade. The only code we own is one script (a few hundred lines) and one chart. |
+This is the requirement that matters most, so it comes first. Zero downtime is
+mostly **application and chart behaviour**, and that part is fully portable.
+The traffic-switching mechanism is secondary.
+
+### 2.1 Baseline: rolling update, works on every Kubernetes
+
+These rules are enforced by the chart and CI. They apply in every environment.
+
+| Rule | Why | Req |
+|---|---|---|
+| `maxUnavailable: 0`, `maxSurge: 1` (or 25%) | Never fewer serving pods than needed | ZDT-01 |
+| `readinessProbe` that checks the service is truly able to serve, and **fails first on shutdown** | New pods get traffic only when ready. Old ones stop getting it before they stop. | ZDT-06 |
+| `preStop` delay (~10 s) + `terminationGracePeriodSeconds` sized for the slowest request/websocket | Gives every load balancer (cloud LB, Gateway, kube-proxy) time to deregister and drain | ZDT-06 |
+| `PodDisruptionBudget` and ≥ 2 replicas in `standard`/`ha` | Node drains and upgrades also don't cause downtime | ZDT-01 |
+| **N / N+1 compatibility** between services and their APIs | During a rolling update, old and new versions coexist and must be able to call each other | ZDT-04 |
+| **Expand/contract database migrations** (pre-upgrade Job, expand only; contract in a later release) | Old and new code both work against the current schema | ZDT-05 |
+| Post-upgrade **smoke test Job** (`helm test`) | Portable release gate that needs no metrics backend | ZDT-03 |
+| Automatic **rollback** if pods don't become ready or the smoke test fails (Flux remediation) | A broken release never takes traffic for long | ZDT-02/03 |
+| Load-balancer readiness integration **where available**: AWS LB readiness gates, GKE NEG readiness gates (automatic) | Removes a known race on cloud LBs. It's an adapter, so it's ignored on-prem. | ZDT-07 |
+
+Rolling updates meet "zero failed requests" for stateless services that follow
+these rules. They need no extra infrastructure and only add `maxSurge` pods.
+
+### 2.2 Optional: blue/green or canary, where it's worth it
+
+Use this when an environment needs **instant switch-back** or **pre-traffic
+verification of the whole new version**, or if the services turn out to be too
+tightly coupled for N/N+1 coexistence (Q1).
+
+- **Mechanism:** **Flagger** (1 pod), driven by the same Flux release, shifts
+  traffic using **Gateway API `HTTPRoute` weights**. Gateway API is implemented on
+  EKS (AWS Load Balancer Controller), GKE (built-in), Alibaba (verify which
+  gateway), and on-prem (Envoy Gateway, Cilium, NGINX Gateway Fabric)
+  *(verify each)*.
+- **Gates:** smoke-test webhooks (portable). Metric checks are optional and use a
+  **PromQL** query. Amazon Managed Prometheus, Google Managed Prometheus, Alibaba
+  ARMS Prometheus and any self-hosted Prometheus all accept PromQL, so one gate
+  definition works everywhere *(verify auth support for managed endpoints)*.
+- **Cost:** briefly double the app pods during a switch. Fine in our AWS accounts
+  thanks to the pod CIDR (§6).
+
+**Recommendation:** rolling as the default everywhere. Blue/green or canary is a
+per-environment profile flag (`delivery.strategy: rolling | bluegreen | canary`),
+switched on only where an environment owner asks for it.
 
 ---
 
-## 3. Build and release (GHES → Artifactory)
+## 3. Layer 1: the product (release artefact)
 
-**Runs in:** GHES Actions on runners in a **tooling account** or ephemeral
-compute. **Never in workload clusters** [NET-04].
-
-On every merge to `main`:
-
-1. Build the 8 images, run unit and integration tests.
-2. Push images to Artifactory. Record each **digest**.
-3. Generate an SBOM and build provenance, and **sign** the images (cosign; Artifactory stores the signatures) [REL-04].
-4. Package the **umbrella chart** `app` with the 8 digests written into `values.yaml`, validate it against `values.schema.json` [REL-05], and push it as an OCI artefact: `oci://artifactory.example/helm/app:1.14.0`.
-5. Attach `deploy.sh`, profile files and release notes to the same version.
-6. **Conformance test on kind**: install, upgrade from N-1, break-and-abort, rollback, using only `helm`, `kubectl` and `deploy.sh` [PORT-01].
-7. Automatically promote to **dev**.
-
-**Rules:** nothing is ever rebuilt for another environment [REL-01]. Nothing
-references `:latest` [REL-02]. One version number identifies the whole stack [REL-03].
-
-### What's in a release
+Built once by GHES Actions, on runners **outside** any workload cluster [NET-04].
 
 ```
-app-1.14.0 (OCI, in Artifactory)
-├── chart/                    umbrella Helm chart, 8 services, digests pinned
-│   ├── values.schema.json    the configuration contract
-│   ├── profiles/minimal.yaml standard.yaml ha.yaml
-│   └── templates/            workloads + exposure adapters (gateway | alb-ingress | service)
-├── deploy.sh                 install / bluegreen / rollback / status / diff
-├── RELEASE_NOTES.md          migrations, N-1 compatibility, rollback limits
-├── sbom.spdx.json, provenance.intoto.jsonl, signatures
+oci://artifactory.example/helm/app:1.14.0         (signed, SBOM + provenance)
+├── values.schema.json          configuration contract (validated)
+├── profiles/minimal|standard|ha.yaml
+├── adapters/                   optional platform adapters, all off by default
+│   ├── aws.yaml   gcp.yaml   alibaba.yaml   onprem.yaml
+├── templates/                  8 services, digests pinned, ZDT rules from §2
+└── RELEASE_NOTES.md            migrations, N-1 compatibility, rollback limits
 ```
+
+- Image references are **digests only**, never tags [REL-02].
+- One version identifies the whole stack [REL-03].
+- The app depends only on **Kubernetes primitives and standard protocols**:
+  - config from ConfigMaps;
+  - secrets from K8s Secrets;
+  - telemetry as OTLP plus `/metrics`;
+  - logs as JSON on stdout;
+  - HTTP exposure through a Gateway API route, an Ingress or a Service.
+
+  [PORT-03]
+- CI runs the conformance suite (install, upgrade N-1→N under load, broken
+  release auto-rollback, optional blue/green) on **kind** for every release, and
+  on EKS plus one non-AWS distribution on a schedule [PORT-02].
 
 ---
 
-## 4. Promotion and deployment (Artifactory → EKS)
+## 4. Layer 2: delivery (identical in every environment we operate)
 
-### Who triggers what
+### 4.1 How a release reaches a cluster
+
+Each environment runs a minimal **Flux** install: `source-controller` and
+`helm-controller`, 2 pods, **with no Git repository involved**.
+
+- An `OCIRepository` watches a **channel** in Artifactory, e.g.
+  `helm/app:channel-custA-prod`.
+- Flux **verifies the cosign signature** before using anything [SEC-04].
+- A `HelmRelease` applies it with the environment's profile + adapter + values,
+  waits for readiness, runs the smoke test, and **rolls back automatically** on
+  failure [ZDT-03].
+- Flux re-applies the release if someone changes the cluster by hand, so drift
+  is corrected, not just detected [OPS-03].
+
+### 4.2 Promotion
 
 ```mermaid
 sequenceDiagram
   autonumber
+  participant D as Developer
   participant G as GHES promote workflow
-  participant A as Approvers (GHES Environment "prod")
-  participant P as CodePipeline (prod account)
-  participant B as CodeBuild in VPC
-  participant K as EKS
-  participant L as ALB + CloudWatch
-  G->>A: request promotion of app 1.14.0
-  A-->>G: approve (recorded: who, when)
-  G->>P: StartPipelineExecution(version=1.14.0, chartDigest=sha256:…)
-  P->>B: run deploy stage (QUEUED mode, one at a time)
-  B->>B: verify signature + provenance
-  B->>K: helm upgrade app-green (idle colour)
-  B->>K: smoke tests via preview host
-  B->>L: weights 90/10, watch 5xx/latency
-  B->>L: weights 0/100, watch hold window
-  B-->>P: success, write /app/prod/current-release (SSM)
+  participant R as Approvers (GHES Environment per target)
+  participant A as Artifactory
+  participant F as Flux in target env
+  D->>G: promote app 1.14.0 → custA-prod
+  G->>R: approval required
+  R-->>G: approved (who/when recorded)
+  G->>A: point channel-custA-prod at 1.14.0 (signed digest)
+  F->>A: poll (1 min), verify signature
+  F->>F: helm upgrade → readiness → smoke test → done or auto-rollback
 ```
 
 | Concern | Design | Req |
 |---|---|---|
-| Trigger | The **promotion**, not the image push. A GHES `promote` workflow calls `StartPipelineExecution` with pipeline variables (version and chart digest). | DEP-03 |
-| Approval | **GHES Environments** with required reviewers for `nonprod` and `prod`. There's one approval record, in the tool developers already use. CodePipeline has no second approval. | DEP-02 |
-| Identity | GHES → AWS via **OIDC** to a role that can *only* start that pipeline. The pipeline's CodeBuild role is the only principal with write access to the cluster. Dev and prod roles are separate. | DEP-04, SEC-01 |
-| Network | GHES needs **outbound AWS API access only**. There's no inbound path to any cluster. CodeBuild runs inside the VPC, reaches the private EKS endpoint, and pulls from Artifactory. | DEP-05 |
-| Serialization | CodePipeline V2 **QUEUED** execution mode means one deploy at a time per environment. | DEP-06 |
-| Record | CodePipeline execution history, CloudTrail, and an SSM parameter `/app/<env>/current-release` (versioned) that anyone can query without cluster access. | DEP-09 |
-| Same as customers | The CodeBuild step does nothing except `helm pull` the release and run its `deploy.sh`. | DEP-01 |
+| Trigger | Moving an environment's channel, which only the GHES promote workflow can do. Pushing an image changes nothing. | DEP-03 |
+| Approval | **GHES Environments**, one per target environment, with required reviewers for prod and customer environments | DEP-02 |
+| Audit | GHES approval record + Artifactory audit log + Flux events | DEP-02 |
+| Credentials | Each environment has **read-only** registry credentials. No deploy credentials exist outside the cluster. Nothing connects inbound. | DEP-04/05 |
+| Serialization | One `HelmRelease` per environment is reconciled one change at a time by design | DEP-06 |
+| "What's running where?" | Flux's notification-controller (optional 3rd pod) posts each result to a GHES commit status or webhook. Or read the channel pointers in Artifactory. | DEP-09 |
 
-Why CodeBuild and not CodePipeline's built-in EKS action: the EKS action only
-applies Helm/kubectl. It can't run smoke tests, move ALB weights or watch
-metrics. CodeBuild in the VPC runs the release's own script, so behaviour is
-versioned with the release.
+### 4.3 Why pull, and why Flux rather than Argo CD
 
-### Per-account footprint (all IaC, e.g. Terraform/OpenTofu)
-
-- VPC wiring: a secondary CIDR `100.64.0.0/16` with 2 pod subnets [NET-03].
-- EKS Auto Mode cluster, private endpoint, access entries (humans = view, break-glass = admin, alarmed).
-- One CodePipeline V2 + one CodeBuild project (VPC-attached) + IAM roles + the GHES OIDC trust.
-- ACM certificate, Route 53 alias to the shared ALB, CloudWatch alarms → SNS.
-- A nightly drift job (EventBridge → same CodeBuild project, `deploy.sh diff`).
-
-Standing up a new environment is `terraform apply` plus one promotion [ENV-03, ENV-04].
+- **Pull is the only model that works for every hosting situation.** Customer
+  networks won't let our GHES or AWS reach in. Registry access is required anyway
+  for images, so it's the one channel every environment already has. Air-gapped
+  sites simply point Flux at their mirror.
+- **Flux, not Argo CD:** 2 pods, no UI or Redis/Dex stack, reads Helm charts
+  straight from OCI registries, verifies cosign signatures natively, and is a
+  CNCF-graduated project. This is not the old Argo platform shrunk. It replaces
+  the entire deployment pipeline with two small controllers.
+- **Customers aren't forced into it.** The chart is an ordinary Helm chart.
+  Customers can install with `helm`, their own Argo CD, or their own Flux
+  (§7). Our Flux setup is just *our* way of operating it, and it's the same in
+  every environment we operate, including dev [DEP-01].
 
 ---
 
-## 5. Zero-downtime blue/green
+## 5. Layer 3: environment adapters
 
-### Shape
+Everything here is selected with values (`adapters/<platform>.yaml`), and the
+app never knows which one is in use. Rows marked *customer* mean the customer
+provides it and we document the interface.
 
-Three Helm releases per environment, all from the same chart:
+| Capability (the contract) | Our AWS (EKS) | GCP (GKE) | Alibaba (ACK) | On-prem / other K8s |
+|---|---|---|---|---|
+| **Kubernetes** | EKS Auto Mode | GKE (Autopilot or Standard) | ACK | Any conformant distro (tested list) |
+| **HTTP exposure** (Gateway API preferred, Ingress fallback) | AWS LBC Gateway/ALB *(verify)* | GKE Gateway | ALB Ingress / Gateway *(verify)* | Envoy Gateway / Cilium / customer's |
+| **TLS certificate** | ACM on the ALB | Google-managed cert | Alibaba Certificate Service | cert-manager, or a customer-supplied Secret |
+| **DNS** | Route 53 in IaC | Cloud DNS | Alibaba DNS | Customer |
+| **Secrets → K8s Secret** | Secrets Manager via External Secrets *or* created by IaC | Secret Manager (same options) | KMS Secrets Manager (same options) | Vault, or a customer-created Secret |
+| **Metrics** (PromQL) | Amazon Managed Prometheus | Google Managed Prometheus | ARMS Prometheus | Customer Prometheus |
+| **Logs** (stdout JSON) | CloudWatch (Container Insights) | Cloud Logging (built in) | SLS | Customer's (Loki/ELK/Splunk) |
+| **Telemetry shipping** | One OpenTelemetry Collector pod, exporter set per platform | same | same | same, or the customer's own collector |
+| **Database** (connection string) | RDS | Cloud SQL | ApsaraDB RDS | Customer-provided, or CloudNativePG |
+| **Pod IP strategy** | Secondary CIDR (§6) | VPC-native alias ranges | Terway/Flannel defaults | Overlay CNI, not an issue |
+| **Registry** | Artifactory | Artifactory or Artifact Registry mirror | Artifactory or ACR mirror | Customer mirror |
 
-| Release | Namespace | Contains |
+**Secrets choice:** where we operate across clouds, **External Secrets
+Operator** (1 pod) is the one tool that speaks to AWS, GCP, Alibaba and Vault
+alike. It's optional: an environment can just have the Secret created by IaC
+or by the customer, and the chart only references `existingSecret` [SEC-02].
+
+---
+
+## 6. Our AWS accounts specifically (the 80-IP problem)
+
+The IP problem is AWS VPC CNI-specific. GKE alias ranges and on-prem overlays
+don't have it in the same way. In **our** AWS accounts:
+
+- **EKS Auto Mode.** AWS runs nodes, CNI, load balancer integration, storage
+  and DNS, so there are no kube-system controllers for us to upgrade.
+- **Pod IPs from a secondary CIDR `100.64.0.0/16`** (Auto Mode NodeClass pod
+  subnets *(verify)*), so pods use no routable IPs.
+- **Fallback** if a secondary CIDR isn't allowed: Fargate (1 IP per pod, no warm pool).
+
+### IP budget (minimal profile, 2 AZs, during an upgrade)
+
+| Line | Routable | Pod CIDR |
 |---|---|---|
-| `app-blue` | `app-blue` | the 8 services, version N |
-| `app-green` | `app-green` | the 8 services, version N+1 (during a release) |
-| `app-edge` | `app-edge` | only the Ingress/route objects: `activeColour`, `weights`, preview host |
+| EKS control-plane ENIs | 4 | — |
+| Node primary IPs (2–3) | 3 | — |
+| App pods (8 + rolling surge; 16 if blue/green) | 0 | 9–16 |
+| Platform pods: Flux 2, OTel Collector 1, (Flagger 1, ESO 1 if used) | 0 | 3–5 |
+| ALB (min 1/AZ, may scale) | 2–8 | — |
+| VPC endpoints (0 if centralised) | 0–10 | — |
+| **Total** | **9–25** | ~21 |
 
-Blue/green works at **whole-stack level**: service-to-service calls stay inside a
-colour, so N never talks to N+1. This is the safe default until Q1 confirms the
-services are independently deployable [ZDT-04].
-
-### Release steps (`deploy.sh bluegreen`)
-
-1. Verify the chart and image signatures [SEC-04].
-2. Read the active colour from `app-edge`. The idle one is the target.
-3. **Expand-only migrations** run as a Job in the idle namespace (a pre-install
-   hook). The old version keeps working on the new schema [ZDT-05].
-4. `helm upgrade --install app-<idle> --wait`. Pods are only Ready once the **ALB
-   target is healthy** (LB readiness gates) [ZDT-07].
-5. **Smoke tests** against `preview.<env-domain>`, which routes 100% to the idle colour [ZDT-08].
-6. Shift weights to **90/10**, then watch the idle colour's target group for 2 minutes:
-   `HTTPCode_Target_5XX_Count`, `TargetResponseTime`, unhealthy hosts.
-7. Shift to **0/100** and watch for the hold window (5 minutes in `minimal`, 30 in `ha`).
-8. Any gate failure **flips weights back** (seconds) and exits non-zero, failing the pipeline [ZDT-03].
-9. On success: write the SSM record and **scale the old colour to 0** (its release
-   is kept, so rollback is "scale up + flip", about 2 minutes) [ZDT-02].
-   In `ha`, the old colour stays warm until the next release.
-
-**Rollback** is a pipeline run with `action=rollback`. It scales up the previous
-colour if needed and flips the weights. One command, rehearsed quarterly.
-
-### Built into every service (chart defaults, enforced by lint)
-
-- `readinessProbe` that checks real dependencies, plus a `preStop` sleep of about 10 s.
-- `terminationGracePeriodSeconds` > ALB deregistration delay (set to 20 s) + preStop [ZDT-06].
-- `maxUnavailable: 0`, `maxSurge: 1`, and a PDB in `standard`/`ha`.
-- Expand/contract migrations: contract steps ship one release *after* the code stops using the old schema. CI runs N-1 against the new schema [ZDT-05].
-
-The same chart also supports plain **rolling** deploys (`deploy.sh install`):
-dev uses it for speed, and simple customers can too. Blue/green is the prod default.
-
-### Traffic layer
-
-On EKS, the `app-edge` release renders an **Ingress for the Auto Mode ALB**
-(IngressGroup = one ALB per environment) with **weighted target groups**, which is
-the most mature mechanism today. For customers, the same release can render a
-**Gateway API `HTTPRoute`** with weighted `backendRefs` instead. That works on GKE,
-Envoy Gateway, Cilium and NGINX Gateway Fabric [PORT-04]. When Gateway API support
-in Auto Mode's load balancing is confirmed GA, EKS switches to it too and the
-Ingress path is retired *(verify)*.
+**Fargate fallback:** 4 + 16 app + ~7 platform (incl. CoreDNS, LB controller)
++ 8 ALB ≈ **35** routable at the blue/green peak, about 28 with rolling. Both are
+under the 50 limit (NET-01) and fit an 80-IP account. Today it's ~130.
 
 ---
 
-## 6. Cluster, compute and network
+## 7. How customers run it
 
-| Choice | Decision | Why |
+| Customer situation | What they do | Zero downtime |
 |---|---|---|
-| Compute | **EKS Auto Mode** | AWS manages nodes (Bottlerocket, auto-patched), VPC CNI, load balancing, EBS CSI and DNS. That leaves **no kube-system controllers for us to own or upgrade**. Costs a small premium on instance price, negligible at 2–3 nodes *(verify current premium)*. |
-| Pod IPs | **Secondary CIDR `100.64.0.0/16`, pod subnets selected in the Auto Mode NodeClass** | Pods stop consuming routable IPs at all. Routable space is only used by the control plane, node primary IPs, the ALB and CodeBuild *(verify NodeClass pod-subnet support)*. |
-| Clusters | **One per account/environment** | No shared fixed overhead to duplicate [NET-06]. |
-| Ingress | One shared ALB per environment, ACM certificate | Replaces cert-manager. TLS ends at the ALB. |
-| DNS | Route 53 records in IaC | Replaces external-dns. The ALB is stable because the IngressGroup is fixed. |
-| VPC endpoints | Use the central network account's if one exists (Q14), plus the free S3 gateway endpoint | Avoids 10–20 routable IPs per account. |
-| CI runners | Tooling account only | Removes ARC from workload clusters [NET-04]. |
+| **We operate it for them** (any cloud/on-prem) | We install Flux + their adapter file. Promotion is a GHES approval. | §2 baseline, blue/green optional |
+| **They operate, with Argo CD or Flux** | Point their tool at the OCI chart and their channel/version | Same chart rules. Their tool performs the rolling upgrade. |
+| **They operate, plain Helm** | `helm upgrade --install app oci://…/app --version 1.14.0 -f profiles/standard.yaml -f adapters/gcp.yaml -f my-values.yaml --wait` | Same chart rules |
+| **Air-gapped** | Mirror the chart + images (one `oras`/`helm` copy script ships with the release), then install from the mirror | Same |
 
-**Fallbacks** if the preferred option isn't available in an account:
-
-| Constraint | Fallback |
-|---|---|
-| Secondary CIDR not allowed (Q3) | **Fargate** for the app pods: exactly 1 routable IP per pod, no warm pool. CoreDNS and the AWS LB controller run on Fargate too. About 35 routable IPs at peak, still within budget. |
-| Auto Mode not approved | Managed node groups + VPC CNI custom networking + `WARM_IP_TARGET=2`, `MINIMUM_IP_TARGET=10`, with AWS-managed add-ons. |
-| IPv6-ready network | An IPv6 cluster removes the problem permanently. Revisit when the enterprise network supports it. |
+Every release ships install/upgrade docs, the compatibility matrix and the
+adapter reference [PORT-05].
 
 ---
 
-## 7. Observability, secrets and security (all managed, near-zero pods)
+## 8. What gets removed
 
-| Function | Decision | Req |
+| Today | Replaced by | Portable? |
 |---|---|---|
-| Release gate metrics | **ALB CloudWatch metrics** per target group, with no agent needed | OBS-03 |
-| App metrics | The app exposes `/metrics` (Prometheus format). Scraped by an **Amazon Managed Prometheus agentless scraper**, or skipped entirely if ALB metrics and logs are enough for now (Q15). | OBS-01/02 |
-| Logs | JSON to stdout → **CloudWatch Logs** through the Container Insights add-on (AWS-managed) | OBS-02/04 |
-| Alerting | CloudWatch alarms → SNS → your on-call channel | — |
-| Secrets | Stored in **Secrets Manager**. `deploy.sh` (AWS adapter) syncs them into K8s Secrets at deploy time. The app only ever reads K8s Secrets. Rotation means redeploying. Add the Secrets Store CSI driver only if rotation needs to happen without a deploy. | SEC-02, PORT-03 |
-| AWS access from pods | **EKS Pod Identity**, if the app needs AWS APIs at all | SEC-05 |
-| Pod security | `restricted` Pod Security Standard on app namespaces. Non-root, read-only root FS. | SEC-03 |
-| Policy | Built-in **ValidatingAdmissionPolicy** rejecting tag-only images, so no Kyverno/Gatekeeper | REL-02 |
-| Human access | EKS access entries: engineers get **view**. A **break-glass** admin role is time-bound with a CloudTrail alarm. | SEC-01 |
-| Drift | Prevented by the above. **Detected** nightly by `deploy.sh diff` against the recorded release, alerting on any difference. **Corrected** by re-running the pipeline. | OPS-03 |
+| Argo CD (+ repo-server, redis, dex, notifications, ApplicationSets) | Flux source + helm controllers (2 pods), reading OCI, not Git | Yes |
+| ARC runners inside workload clusters | GHES runners in a tooling account / ephemeral compute | n/a (our build side) |
+| kube-prometheus-stack in every cluster | App emits OTLP + `/metrics`. One OTel Collector ships to whatever backend the platform has. | Yes |
+| cert-manager everywhere | Platform cert service where one exists. cert-manager only on-prem. | Yes (adapter) |
+| external-dns | DNS in IaC or by the customer | Yes (adapter) |
+| Per-environment manifest forks | One chart + profile + adapter + env values [ENV-01] | Yes |
 
 ---
 
-## 8. IP budget (minimal profile, 2 AZs)
+## 9. Options considered
 
-Uses the model in `docs/03-ip-address-budget.md`. "Routable" means the scarce
-primary CIDR.
+Scored with the weights from `docs/05-proposal-brief.md`, judged against
+**all** target platforms, not just AWS. Scale 1–5, total = Σ score × weight.
 
-| Line | Steady (routable) | Blue/green peak (routable) | Pod CIDR (non-routable), peak |
-|---|---|---|---|
-| A. EKS control-plane ENIs | 4 | 4 | — |
-| B. Node primary IPs (2 → 3 nodes at peak) | 2 | 3 | — |
-| C. App pods (8 → 16 at peak) | 0 | 0 | 16 |
-| D. Platform pods we run | 0 | 0 | ≤ 4 (AWS-managed, if any) |
-| E. Warm pool | 0 | 0 | small, from a /16 |
-| F. Deploy surge | 0 | 0 | included in C |
-| G. ALB (min 1 per AZ, can scale up) | 2 | up to 8 | — |
-| H. VPC endpoints | 0 if central / ~10 if local | same | — |
-| I. CodeBuild deploy ENI (only during a deploy) | 0 | 1 | — |
-| **Total** | **8** (18 with local endpoints) | **16** (26 with local endpoints) | ~20 of 65,536 |
-
-**Fargate fallback, peak:** 4 (A) + 16 app pods + 4 platform pods (CoreDNS, LB
-controller) + 8 (ALB) + 1 (CodeBuild) ≈ **33** routable, or ~43 with local
-endpoints. That's still under NET-01's 50.
-
----
-
-## 9. Customer installation
-
-Customers never see GHES, CodePipeline or our AWS accounts [PORT-01]. They get
-the release and can choose how much of it to use:
-
-| Customer type | How they install |
-|---|---|
-| Simplest | `helm install app oci://…/app --version 1.14.0 -f profiles/minimal.yaml -f my-values.yaml` (rolling updates) |
-| Wants blue/green | `deploy.sh bluegreen --version 1.14.0 --exposure gateway` on any Gateway API implementation |
-| Runs Argo CD / Flux already | Point their GitOps tool at the OCI chart. It's an ordinary Helm chart. |
-| On EKS | The same, plus the optional `alb-ingress` and `aws-secrets` adapters, enabled in values |
-| Air-gapped | Mirror the chart and images to their registry and set `global.registry` [PORT-06] |
-
-CI verifies kind/k3d plus EKS on every release, and one more distribution
-(e.g. GKE or k3s) on a schedule [PORT-02]. Every release ships a compatibility
-matrix and an upgrade guide [PORT-05].
-
----
-
-## 10. What gets removed
-
-| Today | Replaced by |
-|---|---|
-| Argo CD (+ repo-server, redis, dex, notifications, ApplicationSets) | CodePipeline + CodeBuild running `deploy.sh` (0 pods) |
-| ARC runner controller, listeners, runners in-cluster | GHES runners in a tooling account |
-| kube-prometheus-stack (Prometheus, Alertmanager, Grafana, exporters) | ALB CloudWatch metrics, CloudWatch Logs, optional AMP agentless scraper |
-| cert-manager | ACM on the ALB |
-| external-dns | Route 53 in IaC |
-| Self-managed CNI tuning, node groups, autoscaler | EKS Auto Mode |
-| Per-environment manifest forks | One chart + profiles + env values files [ENV-01] |
-
----
-
-## 11. Options I considered and didn't choose
-
-Scored with the weights in `docs/05-proposal-brief.md` (1–5, higher is better).
-
-| Option | IP (25) | ZDT (20) | Simplicity (20) | Customer parity (15) | Security/audit (10) | Cost (5) | Maturity (5) | **Total /500** |
+| Option | IP (25) | ZDT (20) | Simplicity (20) | Customer parity & portability (15) | Security (10) | Cost (5) | Maturity (5) | **Total /500** |
 |---|---|---|---|---|---|---|---|---|
-| **Chosen: CodePipeline + in-VPC CodeBuild running `deploy.sh`** | 5 | 4 | 5 | 5 | 5 | 5 | 4 | **475** |
-| GHES Actions pushing directly to EKS | 5 | 4 | 4 | 5 | 3 | 5 | 4 | **435** |
-| Flux (OCI from Artifactory) + `deploy.sh`-equivalent gates | 4 | 4 | 3 | 4 | 5 | 5 | 5 | **400** |
-| Slimmed Argo CD + Argo Rollouts | 3 | 5 | 2 | 3 | 4 | 4 | 5 | **345** |
-| Keep current platform | 1 | 3 | 1 | 2 | 3 | 2 | 5 | **200** |
+| **Chosen: Flux-OCI pull + chart ZDT rules (+ Flagger optional)** | 4 | 4 | 4 | 5 | 5 | 5 | 5 | **435** |
+| Customer-style manual `helm upgrade` runbooks everywhere | 5 | 3 | 2 | 5 | 4 | 5 | 5 | **390** |
+| v1: CodePipeline on AWS + a different mechanism per other platform | 5 | 4 | 2 | 1 | 5 | 5 | 4 | **355** |
+| GHES self-hosted runner in every environment, pushing | 4 | 4 | 3 | 3 | 3 | 4 | 4 | **355** |
+| Argo CD + Argo Rollouts everywhere | 2 | 5 | 2 | 4 | 4 | 3 | 5 | **330** |
 
-(Total = Σ score × weight.)
-
-- **GHES pushing directly** is close, but it needs a network path from runners into
-  every private cluster. It also puts prod-write credentials in the CI trust domain.
-  It's fine for dev if you want it.
-- **Flux** is the right answer if you later decide you *want* continuous drift
-  correction, or you operate many customer accounts yourselves (Q8). It reads the
-  same OCI chart, so switching later is cheap. That's a deliberate property of
-  this design.
-- **Argo Rollouts / Flagger** become worth it only if scripted gates prove
-  inadequate, e.g. if you need canary analysis across many metrics. Not at
-  < 10k users.
-- **Sensitivity:** swapping the IP and ZDT weights doesn't change the winner (470, vs GHES
-  push 430, Flux 400, Argo 355).
+- **Sensitivity:** with the IP and ZDT weights swapped, Flux scores 435, manual
+  Helm 380 and Argo 345. With simplicity weighted 25 and portability 10, Flux
+  scores 430 and manual Helm 375. The winner doesn't change.
+- **v1 (CodePipeline) loses** because it only works on AWS. Every other platform
+  would need its own deployment system, which recreates today's snowflakes.
+- **GHES runners per environment lose** because customer networks rarely allow
+  outbound access to our GHES, and prod deploy rights would live in CI.
 
 ---
 
-## 12. Risks and assumptions
+## 10. Risks and assumptions
 
-| # | Risk / assumption | If wrong | Linked question |
+| # | Assumption | If wrong | Question |
 |---|---|---|---|
-| R1 | The 8 services are fine to release together as one stack | If they release independently, run per-service blue/green in the same mechanism (one colour pair per service) | Q1 |
-| R2 | Blue/green is truly wanted in prod | If not, use rolling everywhere: simpler and fewer peak pods | Q2 |
-| R3 | A secondary CIDR can be associated to workload VPCs | Use the Fargate fallback (§6) | Q3 |
-| R4 | CodeBuild in the VPC can reach Artifactory (private link, proxy or allowed egress) | Add an ECR pull-through/replication of release artefacts as a cache *(ADR needed)* | Q5 |
-| R5 | GHES OIDC tokens can be trusted by AWS IAM. This needs the GHES OIDC discovery endpoint reachable by AWS, or published publicly. | Use runner instance roles in the tooling account to assume the trigger role | Q4 |
-| R6 | Auto Mode NodeClass supports custom pod subnets, and Auto Mode's ALB supports weighted target-group actions | Managed node groups + custom networking + AWS LB controller (2 pods) | *(verify)* |
-| R7 | The app tolerates N and N+1 against one schema | This is engineering work in the app, not the platform, and is required for any zero-downtime approach | Q7 |
-| R8 | Customers are all on Kubernetes | A docker-compose profile would be a separate product decision | Q9 |
+| R1 | We operate at least some customer environments (not only self-install) | If customers always self-install, Flux is used only in our own envs, and the design otherwise stands | Q8 |
+| R2 | Every environment can reach Artifactory or a mirror of it | Air-gapped flow (§7) becomes the norm. Promotion becomes "ship a signed bundle". | Q5 |
+| R3 | Services can coexist at N and N+1 during a rolling update | Use stack-level blue/green (Flagger, or two releases + Gateway weights) as the default | Q1 |
+| R4 | Target platforms provide a Gateway API implementation (only needed for blue/green/canary) | Ingress-based fallback, or rolling only on that platform | Q9 |
+| R5 | Secondary CIDR is allowed in our AWS VPCs | Fargate fallback (§6) | Q3 |
+| R6 | DB schema changes can follow expand/contract | Required by *any* zero-downtime design. It's app work, and needs scheduling. | Q7 |
 
-Items marked *(verify)* must be checked against current AWS documentation
-before Phase 2 (AGENTS.md rule 6).
+Items marked *(verify)* are checked against current vendor docs before build
+(AGENTS.md rule 6).
 
 ---
 
-## 13. Delivery plan
+## 11. Delivery plan
 
-Thin vertical slices, each demoable. Sizes are rough estimates for 1–2 engineers.
-
-| # | Slice | Proves | Size |
+| # | Slice | Proves | Size (1–2 engineers) |
 |---|---|---|---|
-| 1 | Umbrella chart + digests + schema + signing, published from GHES; installs on kind | REL-*, PORT-01 | 1–2 wks |
-| 2 | `deploy.sh install/bluegreen/rollback/diff` + conformance suite on kind (load test, broken release, rollback) | ZDT-* | 2 wks |
-| 3 | Dev account IaC: secondary CIDR, Auto Mode, ALB, CodePipeline/CodeBuild, GHES promote workflow. **Measure IPs.** | DEP-*, NET-01 | 2 wks |
-| 4 | Nonprod with approvals, SSM release record, drift job, alarms | DEP-02/09, OPS-03 | 1 wk |
-| 5 | Deploy into an ~80-IP account (or a deliberately constrained VPC) | NET-02 | 2–3 days |
-| 6 | Prod: run new and old side by side, **Route 53 weighted cutover** old → new, then decommission | MIG-* | 1–2 wks |
-| 7 | Customer docs, compatibility matrix, second-distribution CI | PORT-02/05 | 1 wk |
+| 1 | Chart with ZDT rules, digests, schema, signing, published from GHES. Conformance on kind: load test during upgrade, broken-release rollback. | ZDT-*, REL-*, PORT-01 | 2–3 wks |
+| 2 | Flux-OCI channel + GHES promote workflow with approvals, on kind, then dev EKS (Auto Mode + pod CIDR). **Measure IPs.** | DEP-*, NET-01 | 2 wks |
+| 3 | AWS adapter file (ALB/ACM/AMP/CloudWatch/Secrets), nonprod | PORT-03, OBS-* | 1 wk |
+| 4 | **Second platform** adapter on GKE (or the first real non-AWS customer's platform) + an on-prem-style kind cluster with Envoy Gateway | PORT-02 | 1–2 wks |
+| 5 | Optional blue/green profile (Flagger + Gateway API) proven on two platforms | ZDT-04/08 | 1 wk |
+| 6 | Prod migration: run both, DNS cutover, decommission the old stack | MIG-* | 1–2 wks |
+| 7 | Customer docs, air-gap mirror script, compatibility matrix | PORT-05/06 | 1 wk |
 
-Roughly **8–10 weeks** to prod cutover, depending on the open questions and on
-how much expand/contract work the app's database migrations need.
+About **9–12 weeks** to prod cutover, depending on how much the app needs
+changing for graceful shutdown, N/N+1 compatibility and expand/contract
+migrations. That app work is required whatever platform is chosen.
 
 ---
 
-## 14. Decisions needed from you
+## 12. Decisions needed from you
 
-1. **Approve the direction**, or tell me which section to rework.
-2. Answer **Q1–Q5** in `docs/06-open-questions.md`. Q2 (is blue/green really
-   needed?) and Q3 (secondary CIDR allowed?) change the design most.
-3. Run `scripts/inventory-ip-usage.sh` in one current account, so we replace
-   estimates with measured numbers before building.
-
-Once approved, each row of §1 becomes an ADR (`docs/adr/0003…`) marked
-`Accepted`, and Phase 2 starts with slice 1.
+1. **Do we operate deployments inside customer environments, or do customers
+   always self-install?** (Q8; the biggest question now)
+2. Which non-AWS platforms are **real today**: GKE, Alibaba ACK, which on-prem distributions? (Q9)
+3. Are the 8 services safe to run at mixed versions (N and N+1) during an
+   upgrade? (Q1; decides whether rolling is enough by default)
+4. Do all environments have registry access, or are some air-gapped? (Q5)

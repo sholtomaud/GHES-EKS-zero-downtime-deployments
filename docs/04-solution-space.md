@@ -39,7 +39,7 @@ flowchart LR
 | D. Argo CD Core (slimmed) | Keep Argo CD without UI/Dex/notifications. | 3–4 | Familiar to the team. | Still the heaviest. The main problem was the stack around it, not just Argo. |
 | E. Keep current platform | — | many | No migration. | Fails NET-01/02. |
 
-**Reviewer's lean:** A or C. A if the organisation values AWS-native audit and
+**Update:** PROPOSAL.md v2 chooses **C (Flux-OCI)**, because A only works on AWS and the delivery mechanism must work on every platform we operate [PORT-07, PORT-08]. Original note: A or C. A if the organisation values AWS-native audit and
 wants zero resident pods. C if pull-based security and drift correction are
 valued, and 2–3 pods are affordable (they are, with secondary CIDR). B is
 attractive for its simplicity, but the network path and the CI-holds-prod-keys
