@@ -14,16 +14,9 @@ database. Docker Desktop needs a paid
 licence at our size. No existing requirement covers local development, so
 DEV-01..08 are proposed alongside this ADR.
 
-Rev 2 answers: laptops already route to the dev VPC (Q21). Clean holds real
-data, which laptops may query but not copy (Q22). No corporate CA or proxy is
-needed (Q24). Dev is shared with the dev EKS environment (Q25).
-
-Rev 3: synthetic data locally for now. The VPN is always on.
-
-Rev 4: local data comes from a generator script, not stored files. The dev RDS
-holds the "dirty" test data, and isn't reset. Connecting to it needs no config
-file: a script fetches the URL and password and sets them in the containers'
-environment.
+Laptops are on an always-on VPN that routes to the dev VPC. The dev database
+holds "dirty" test data: samples of actual data, no PII. Clean holds real data.
+GHES and Artifactory run on EC2 in our tooling account.
 
 Full analysis: [docs/proposal/local-development.md](../proposal/local-development.md).
 
@@ -76,7 +69,7 @@ reproducibility 15, maintenance 10, licence 5 (total /500).
   IPs in the dev account (two RDS instances). The DB port is reachable from
   the VPN pool, so authentication and grants carry the access control. Someone owns
   the seed generator and keeps it in step with migrations.
-- Follow-ups: add RDS ENIs to the main IP budget (PROPOSAL.md §3.6). Get the VPN client pool CIDR from the network team at build time. Move DEV-* from proposed to the contract on acceptance.
+- Follow-ups: get the VPN client pool CIDR from the network team at build time. Move DEV-* from proposed to the contract on acceptance.
 
 ## Verification
 

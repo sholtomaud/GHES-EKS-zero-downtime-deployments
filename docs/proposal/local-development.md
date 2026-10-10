@@ -1,28 +1,6 @@
 # Proposal: local development workflow
 
-**Status:** Proposed, for review (rev 4)  ·  **Date:** 2026-10-10  ·  **ADR:** [ADR-0003](../adr/0003-local-development-workflow.md)
-
-> **Rev 2 incorporates answers to Q21–Q25.** Laptops already route to the dev
-> VPC, so they connect **directly on 5432, through a narrowly scoped security
-> group rule** (§5.5), and the SSM tunnel is dropped. **Clean holds real
-> data:** laptops may *query* it, as named people only, and never copy it
-> (§5.1, §5.4). So dev is **no longer reset from clean** (Q26). No corporate
-> CA or proxy is needed. Dev is shared with the dev EKS environment.
->
-> **Rev 3:** **synthetic data locally is the default for now.** A developer
-> connects to the shared dev RDS only when they need it, by adding a
-> **`./.env.local`** file (§5.2; its role changed in rev 4). The VPN is **always on**, so the SG source is
-> simply the VPN client pool, and the SSM fallback is gone (§5.5).
->
-> **Rev 4:** local synthetic data comes from a **generator script**. No data
-> files are stored in the repo (§5.3). The **dev RDS holds the "dirty" test
-> data**, and `make dev DB=dev` connects to it. **`./.env.local` is for the
-> local database only.** For RDS, the script fetches the URL and password from
-> Secrets Manager and passes them straight into the containers' environment,
-> with no file (§5.2.1). Dev is **not reset to synthetic data**:
-> its contents are the point (§5.2). **Dev holds no PII, but does hold samples
-> of actual data** (Q28). So the shared DML-only role is fine, and the
-> no-copy rule applies to dev too (§5.4).
+**Status:** Proposed, for review  ·  **Date:** 2026-10-10  ·  **ADR:** [ADR-0003](../adr/0003-local-development-workflow.md)
 
 How a developer on a Windows laptop builds and runs the `api`, `agent` and
 `frontend` containers locally in VS Code. It runs against generated synthetic
@@ -152,7 +130,7 @@ built to allow that, since `make dev` works without it.
 - **F (hosted)**: it removes the Windows friction, but it's a new platform to
   run, secure and pay for. An internal developer platform is an explicit
   non-goal (`01-context-and-problem.md`). It's the right fallback only if
-  WSL turns out to be unworkable in practice (see §8, R3).
+  WSL turns out to be unworkable in practice (see §8, R2).
 
 ---
 
@@ -168,7 +146,7 @@ built to allow that, since `make dev` works without it.
 | Line endings | `.gitattributes`: `* text=auto eol=lf` | Avoids CRLF-broken shell scripts and Dockerfiles from Windows-side git |
 | Resources | `.wslconfig` documented: e.g. `memory=8GB`, `processors=4` | WSL2 otherwise grows to take half of RAM by default |
 | WSL networking with the corporate VPN | `.wslconfig` `networkingMode=mirrored` if VPN routes or DNS don't reach WSL in default NAT mode *(verify on our Windows build)* | Laptops reach the dev VPC over the corporate route (Q21). Some VPN clients don't pass that route into WSL2's NAT network, so slice 1 must test it. |
-| Corporate CA / proxy | **Not needed** (Q24) | Laptops reach Artifactory directly. The `dev` image stage only adds the public **RDS CA bundle**, for `sslmode=verify-full`. |
+| Corporate CA / proxy | None (Q24) | Laptops reach Artifactory (EC2, tooling account) over the VPN. The `dev` image stage only adds the public **RDS CA bundle**, for `sslmode=verify-full`. |
 
 **Rootless UID mapping.** Bind-mounted source must stay owned by the developer,
 not by a subuid. Use `userns_mode: keep-id` in compose for source-mounting
@@ -472,7 +450,7 @@ the port, scoped like this:
 
 | Control | Setting | Why |
 |---|---|---|
-| Source | **The VPN client address pool** (one or a few CIDRs, from the network team at build time) in a managed prefix list in IaC. Not the whole on-prem range. | With an always-on VPN every laptop is in that pool, so it's a one-line lookup, not a design question. It keeps the DB port off on-prem servers and datacentre subnets. Per-user addresses don't matter: identity comes from the DB login (§5.4). |
+| Source | **The VPN client address pool** (one or a few CIDRs, from the network team at build time) in a managed prefix list in IaC. Not the whole corporate network. | With an always-on VPN every laptop is in that pool, so it's a one-line lookup, not a design question. It keeps the DB port off on-prem servers and datacentre subnets. Per-user addresses don't matter: identity comes from the DB login (§5.4). |
 | Destination | **One security group per RDS instance** (dev, clean), each with only the `tcp/5432` rule from that list. Separate from the rule that lets dev EKS pods in. | Laptop access can be removed or narrowed without touching the app's path. Clean can use a tighter list later if needed. |
 | Port | `5432` only. No other ingress. | |
 | Exposure | `publicly_accessible = false`, private subnets only | Reachable from the corporate route, never from the internet |
@@ -483,7 +461,7 @@ the port, scoped like this:
 **Rejected:**
 - **SSM port forwarding:** not needed with an always-on VPN. It would cost a
   host and an IP.
-- **Opening 5432 to the whole private range:** every on-prem server and any
+- **Opening 5432 to the whole private range:** every corporate server and any
   compromised host could reach the DB port. Scoping to the VPN pool costs
   nothing.
 - **Public RDS:** the DB would be on the internet.
@@ -492,19 +470,17 @@ the port, scoped like this:
 
 ## 6. IP impact (dev account)
 
-AGENTS.md rule 3 requires an IP count. Laptops consume no VPC IPs. The dev
-account gains:
+AGENTS.md rule 3 requires an IP count. Laptops consume no VPC IPs. In the dev
+account:
 
 | Line | IPs | Notes |
 |---|---|---|
 | RDS dev (single-AZ) | 1 | Multi-AZ would add a standby ENI |
 | RDS clean (single-AZ) | 1 | |
 | Laptop access (direct route, §5.5) | 0 | SG rules and a prefix list use no IPs |
-| **Total added** | **2** | Dev minimal peak goes from ~33 (PROPOSAL.md §3.6) to ~35. Still ≤ 50 [NET-01]. |
 
-**Gap found:** PROPOSAL.md §3.6 doesn't count **RDS ENIs** in any environment.
-That should be fixed in the main budget (+1 per single-AZ instance, +2 for
-Multi-AZ). It doesn't change the verdict for any profile.
+The dev RDS is already counted in the main budget (PROPOSAL.md §3.6). Clean
+adds 1, so the dev account's minimal peak is ~35. That's still ≤ 50 [NET-01].
 
 ---
 
@@ -527,15 +503,13 @@ Multi-AZ). It doesn't change the verdict for any profile.
 
 | # | Assumption | If wrong | Q |
 |---|---|---|---|
-| R1 | ~~Laptops can reach the dev VPC~~ **Confirmed** (Q21). VPN is always on. Remaining: the VPN route also reaches *inside WSL2* | `networkingMode=mirrored`; failing that, the VPN vendor's WSL guidance | Q21 |
-| R2 | **Resolved: clean holds real data** (Q22). Design changed: query-only, named and audited access; generated local data; nothing copied from clean. | — | Q22, Q26 |
-| R9 | **Confirmed: no PII on dev** (Q28), but it holds samples of actual data. | If PII ever lands there, laptop access to dev moves from the shared `app_dev_local` role to per-person, audited logins (as clean), and the app containers must use them | Q28 |
-| R3 | WSL2 + rootless Podman + Dev Containers works on our managed Windows build (endpoint security, Hyper-V policy). **Believed yes** (Q23). | Slice 1 will show it. Fallback: option A for toolchain, then option F if WSL itself is blocked. | Q23 |
-| R4 | **Resolved:** no corporate CA or proxy needed (Q24) | — | Q24 |
-| R5 | The app reads DB settings from env/file (hosting contract §2.2), so local and cluster delivery are identical | Small app change, needed for portability anyway | Q7 |
-| R6 | Branch code tolerates `main`'s schema (expand/contract) | That's a ZDT-05 violation, which the local stack exposes early. That's a feature. | — |
-| R7 | **Believed shared** with dev EKS (Q25). Laptop writes land in the dirty test data the dev environment also uses. | If laptop edits make that data unreliable, take a snapshot of dev to restore from, or give laptops their own copy on the same instance. | Q25 |
-| R8 | The application owner approves named, audited, read-only laptop access to real data in clean | If not, clean is reachable only from an in-VPC host (e.g. via SSM), never directly from laptops | Q22 |
+| R1 | The always-on VPN route also reaches *inside WSL2* and rootless containers | `networkingMode=mirrored`; failing that, the VPN vendor's WSL guidance | Q21 |
+| R2 | WSL2 + rootless Podman + Dev Containers works on our managed Windows build (endpoint security, Hyper-V policy) | Slice 1 will show it. Fallback: option A for toolchain, then option F if WSL itself is blocked. | Q23 |
+| R3 | The app reads DB settings from env/file (hosting contract §2.2), so local and cluster delivery are identical | Small app change, needed for portability anyway | Q7 |
+| R4 | Branch code tolerates `main`'s schema (expand/contract) | That's a ZDT-05 violation, which the local stack exposes early. That's a feature. | — |
+| R5 | Laptop writes to the dirty test data, which the dev EKS environment also uses, don't disrupt dev-environment testing | If laptop edits make that data unreliable, take a snapshot of dev to restore from, or give laptops their own copy on the same instance. | Q25 |
+| R6 | The application owner approves named, audited, read-only laptop access to real data in clean | If not, clean is queried only from a host inside the VPC, never directly from laptops | Q22 |
+| R7 | Dev stays free of PII (it holds samples of actual data) | If PII ever lands there, laptop access to dev moves from the shared `app_dev_local` role to per-person, audited logins (as clean), and the app containers must use them | Q28 |
 
 Unverified items, which slice 1 must check against current docs and cite:
 - Dev Containers' current Podman support statement.
@@ -552,11 +526,11 @@ Unverified items, which slice 1 must check against current docs and cite:
 
 | # | Slice | Proves | Size |
 |---|---|---|---|
-| 1 | On **one real managed Windows laptop**: WSL2 + Podman + compose + Dev Container for `api` only, with `DB=local`. Settle the keep-id/user combination. **Prove the VPN route reaches RDS from inside a rootless container in WSL.** | R1, R3, DEV-07 | 2–3 days |
+| 1 | On **one real managed Windows laptop**: WSL2 + Podman + compose + Dev Container for `api` only, with `DB=local`. Settle the keep-id/user combination. **Prove the VPN route reaches RDS from inside a rootless container in WSL.** | R1, R2, DEV-07 | 2–3 days |
 | 2 | Dev account: two RDS instances, VPN-pool prefix list + SGs, `force_ssl`, roles and grants, IAM-only clean with pgaudit, two SSO permission sets, one Secrets Manager secret. In IaC. | DEV-04, DEV-06, DEV-08, §5.5 | 3–4 days |
 | 3 | `make dev` for api + agent + frontend: local synthetic by default, dev RDS via `make dev DB=dev` (`up.sh`); `pin-release`/`SRC=`; tasks.json, launch.json; banner | DEV-01/02/03 | 3–4 days |
 | 4 | Seed generator (deterministic, sized, deliberately messy), `make seed`, refusal unless `DB=local` | §5.3, DEV-03 | 2–3 days |
 | 5 | Timed onboarding with a new team member; fix what they hit | DEV-05 | 1 day |
 
 About **2–3 weeks** for one engineer. It can run in parallel with PROPOSAL.md
-§7 slices 1–2, since it only needs the dev account.
+§6 slices 1–2, since it only needs the dev account.
