@@ -1,4 +1,4 @@
-# Proposal: lean, zero-downtime delivery (v6)
+# Proposal: lean, zero-downtime delivery (v7)
 
 **Status:** Proposed, for review  ·  **Date:** 2026-10-10
 
@@ -21,6 +21,14 @@ The recommended design, written to be read on its own. The rest of the repo
 > on-prem. Copying releases into ECR is now a recommendation for availability,
 > not a necessity (§3.2). The customer-registry options are re-weighed (§2.5).
 > CI can use plain IAM roles instead of OIDC (§3.3).
+> **v7 incorporates:**
+> - Customer registry decided: **B, ECR distribution account**.
+> - **ECR copy** confirmed for our clusters.
+> - **Some customers are air-gapped** (my reading of your "yes"), so a signed
+>   **offline bundle** is now required (§2.5).
+> - The app's stateful dependencies are **Postgres, Redis, queues and object
+>   storage**: portable contracts and zero-downtime rules for each (§2.6), and
+>   they're now counted in the IP budget (§3.6).
 
 ---
 
@@ -30,7 +38,7 @@ The recommended design, written to be read on its own. The rest of the repo
 |---|---|---|
 | Who deploys | Our CI/CD | The customer, with their tools (Helm, their Argo CD/Flux, scripts) |
 | Platform | EKS, AWS managed services allowed | Their EKS, GKE, ACK or on-prem. **No AWS services assumed.** |
-| How they get releases | Copied by digest from our Artifactory into **ECR** (§3.2) | **Pull from a customer-facing registry we expose** (§2.5) |
+| How they get releases | Copied by digest from our Artifactory into **ECR** (§3.2) | **Pull from our ECR distribution registry**, or import a **signed offline bundle** if air-gapped (§2.5) |
 | Zero downtime comes from | The chart's built-in behaviour **plus** our pipeline gates | **The chart's built-in behaviour alone** |
 
 The design:
@@ -54,8 +62,9 @@ The design:
    Artifactory maintenance or outages (§3.2).
 5. **EKS with every pod on Fargate.** Each pod uses exactly one IP, with no
    node warm pools and no DaemonSets, and there are no nodes for us to patch.
-   That's an estimated **~18 routable IPs at steady state and ~33 at the peak of
-   a release**, with no secondary CIDR. Today it's ~130.
+   That's an estimated **~21 routable IPs at steady state and ~36 at the peak of
+   a release** (minimal profile, including the data stores), with no secondary
+   CIDR. Today it's ~130.
 6. **Argo CD, ARC, the in-cluster Prometheus stack, cert-manager and
    external-dns are removed.** AWS managed services replace them **in our
    accounts only**. The app never requires them.
@@ -94,6 +103,12 @@ oci://releases.<our-domain>/helm/app:1.14.0   signed (cosign), SBOM + provenance
 ├── adapters/   aws.yaml  gcp.yaml  alibaba.yaml  generic.yaml   (examples, all optional)
 ├── templates/                                8 services, digests pinned, zero-downtime rules (§2.3)
 └── docs/       INSTALL.md  UPGRADE.md  ROLLBACK.md  COMPATIBILITY.md  RELEASE_NOTES.md
+
+app-1.14.0-offline.tar                        for air-gapped sites (§2.5)
+├── oci-layout/                               chart + 8 images + signatures/SBOM, by digest
+├── import.sh                                 pushes everything into the customer's registry (needs only oras/skopeo)
+├── cosign.pub                                our public signing key, for offline verification
+└── SHA256SUMS, SHA256SUMS.sig
 ```
 
 Built **once** in GHES. Promotion never rebuilds [REL-01]. Digests only, never
@@ -106,7 +121,10 @@ tags [REL-02]. One version identifies the whole stack [REL-03].
 | HTTP exposure | Gateway API `HTTPRoute`, Ingress, or plain Service (values switch) | ALB via AWS Load Balancer Controller | GKE Gateway, Alibaba ALB, Envoy Gateway, Cilium, NGINX… |
 | TLS | Terminated at the gateway/LB, or a referenced Secret | ACM | Cloud cert services, cert-manager, their own CA |
 | Secrets | `existingSecret` name(s); the app reads K8s Secrets only | Secrets Manager, synced at deploy time | Vault, cloud secret stores, manual |
-| Database | Connection settings via Secret | RDS | Cloud SQL, ApsaraDB, their Postgres |
+| **PostgreSQL** | Connection settings + CA via Secret; supported major versions in the compatibility matrix | RDS for PostgreSQL | Their Postgres (managed, or e.g. CloudNativePG / Patroni on-prem) |
+| **Redis** | Redis protocol, endpoint + auth via Secret, TLS optional | ElastiCache (Valkey or Redis OSS) | Valkey or Redis they run |
+| **Queues** | **Depends on the technology the app uses today (Q21)**. Must be a protocol available both in AWS and on-prem (§2.6). | SQS, Amazon MQ or MSK (per Q21) | RabbitMQ / Kafka they run |
+| **Object storage** | **S3 API** with configurable endpoint, region, path-style addressing, custom CA, and credentials via Secret | S3 (IRSA, no keys) | Any S3-compatible store: Ceph RGW, MinIO (check current licensing), NetApp StorageGRID, etc. |
 | Metrics | `/metrics` (Prometheus format) + optional OTLP | CloudWatch / Amazon Managed Prometheus | Their Prometheus, GMP, ARMS, Datadog… |
 | Logs | JSON on stdout | CloudWatch Logs (Fargate built-in log router) | Whatever their cluster collects |
 | Workload identity | Optional, by values | IRSA (Pod Identity isn't supported on Fargate *(verify)*) | Not required |
@@ -168,30 +186,73 @@ on-prem realities:
   the strictest common policy.
 - **Private registry mirror.** Installs run from a mirror, with
   `global.registry` overridden [PORT-06].
+- **Air-gapped install.** The offline bundle is imported and installed with all
+  egress blocked. This proves the app makes **no internet calls**: no public
+  images, CDNs, licence checks or telemetry endpoints [PORT-06].
+- **Stateful dependencies.** Upgrade and rollback tests run against real
+  Postgres, Redis, the queue broker and an S3-compatible store in the kind
+  cluster, so the compatibility rules in §2.6 are exercised.
 
 [PORT-01/02] Each release ships a compatibility matrix [PORT-05].
 
-### 2.5 Customer-facing release registry (decision needed)
+### 2.5 Getting releases to customers (decided: ECR distribution account)
 
-Customers pull releases from a registry we expose. Only releases approved as
-**GA** in GHES are copied there, by digest and with their cosign signatures.
-Each customer gets a **read-only, revocable token**. Internal dev and nonprod
-builds are never visible. Where that registry lives is a real choice:
+**Connected customers** pull from **ECR in a dedicated distribution account**.
+This was option B; you chose it over exposing Artifactory or running a
+separate registry.
+- Only releases approved as **GA** in GHES are copied there, by digest and
+  with their signatures, SBOM and provenance. Dev and nonprod builds are never
+  visible.
+- Each customer gets a **dedicated IAM principal** with pull-only access to the
+  release repositories. Credentials can be revoked, and every pull is logged
+  in CloudTrail.
+- ECR login tokens last 12 h, so we document two ways to handle that: a
+  registry mirror that refreshes them automatically (Harbor, Artifactory, Nexus
+  and others support ECR as an upstream), or a credential helper. Mirroring is
+  recommended either way, so customers' running apps never depend on our
+  registry.
 
-| Option | Customer experience | Security / ops | Cost |
-|---|---|---|---|
-| **A. Expose a dedicated release repo on our Artifactory** (public ALB + WAF in front, only that repo routable) | Best: standard registry login with long-lived scoped tokens. Works with any mirror tool. | Puts the **self-maintained system that holds every internal build** on the internet. Its patching and availability become customer-facing. Needs security sign-off. | Low (existing licence) |
-| **B. ECR in a dedicated "distribution" AWS account** | OK: ECR login tokens last 12 h, so customers need a credential helper or a mirror that refreshes (Harbor, Artifactory, Nexus and others support ECR as an upstream) | Build Artifactory stays private. Managed, highly available, IAM-scoped per customer, CloudTrail audit. Holds only GA releases. | Very low |
-| **C. A separate registry with token auth** (e.g. a JFrog edge node or Harbor in AWS) holding only GA releases | Best | Build Artifactory stays private, but one more system to run or license | Medium |
+**Air-gapped customers** get a **signed offline bundle** of the same release
+(§2.1).
+- Stored in an S3 bucket in the distribution account and downloaded with a
+  per-customer, time-limited presigned URL, then transferred however their
+  process requires.
+- `import.sh` pushes the chart and images, by digest, into their internal
+  registry. From then on, install is the normal `helm upgrade` with
+  `global.registry` set.
+- **Signing must work offline.** Images, chart and bundle are signed with
+  **cosign using a key held in AWS KMS**, and the public key ships with every
+  release. Keyless (Sigstore/Fulcio/Rekor) signing is **not** used, because
+  verifying it needs internet access.
 
-**Recommendation: B.** It's now a closer call: with Artifactory in AWS, A no
-longer exposes on-prem infrastructure. But A still puts a self-maintained
-system that holds every internal build on the internet, whereas B exposes a
-managed registry holding only GA releases. B also reuses the ECR copy step from
-§3.2. Customer friction is limited because we already recommend they **mirror
-into their own registry**, and on-prem customers usually must anyway. If
-security approves A, or customers find ECR auth too awkward, switching to A or C
-changes nothing in the release or the chart.
+
+### 2.6 Stateful dependencies: portability and zero downtime
+
+The chart **does not run production data stores**. In our accounts they're AWS
+managed services. On customer sites they're customer-provided prerequisites,
+listed in `COMPATIBILITY.md`. An optional **evaluation profile** may start
+single-replica Postgres, Redis, a broker and an S3-compatible store in-cluster,
+for trials only. It's unsupported for production.
+
+During a rolling upgrade **and** a rollback, versions N and N+1 share every
+store. Each store therefore gets its own compatibility rule, enforced by
+review checklists and the conformance tests:
+
+| Store | Rule for zero-downtime upgrade **and** rollback |
+|---|---|
+| **PostgreSQL** | **Expand/contract.** Release N only *adds* (nullable columns, new tables, backfills in batches). Code stops using old structures in N+1. Removal no earlier than N+2. No down-migrations: rollback relies on N-1 running on N's schema. Migrations run once, as a pre-upgrade Job with an advisory lock, and must avoid long table locks (`CREATE INDEX CONCURRENTLY`, no blocking `ALTER`s on big tables). |
+| **Redis** | Values written by N must be readable by N-1 and vice versa. Use **additive serialization** (tolerant readers), or put a schema version in key prefixes when a format must change. Cache misses must be harmless. If sessions live in Redis, no sticky sessions are needed, which helps rolling updates. |
+| **Queues** | **Tolerant messages:** consumers accept both the old and new message versions. Producers add fields and never remove or rename them within a release. Consumers stop fetching on SIGTERM and finish or release in-flight messages before exiting (grace period ≥ the longest handler). Handlers are **idempotent**, because redelivery happens during rollouts. |
+| **Object storage** | Object keys and metadata formats change additively. N-1 must still read objects N writes. Use versioned prefixes for format changes, and enable bucket versioning in our accounts so objects can be recovered. |
+
+**Portability of each store:**
+- **Postgres, Redis and S3** are portable as-is: standard protocols with
+  managed services on every cloud and mature on-prem options.
+- **Queues are the risk.** If the app uses **SQS** directly, there's no
+  on-prem SQS. Then either the app gets a small queue abstraction with two
+  backends (SQS and RabbitMQ/AMQP), or we standardise on a protocol that
+  exists in both worlds: **RabbitMQ** (Amazon MQ in AWS) or **Kafka** (MSK in
+  AWS). Q21 decides which.
 
 ---
 
@@ -204,7 +265,7 @@ GHES Actions runs on runners in a **tooling account** or on ephemeral compute,
 
 1. Build and test the 8 images.
 2. Push them to Artifactory and record the digests.
-3. Sign them, and attach the SBOM and provenance.
+3. Sign them with **cosign using an AWS KMS key** (verifiable offline), and attach the SBOM and provenance.
 4. Package the chart with the digests and push it as OCI.
 5. Run the conformance suite (§2.4).
 6. Promote to dev automatically.
@@ -298,14 +359,15 @@ product.
 | Ingress / TLS / DNS | One shared ALB per environment (IngressGroup), ACM certificate, Route 53 records in IaC |
 | Telemetry | ALB CloudWatch metrics (release gate). **Fargate's built-in Fluent Bit log router** → CloudWatch Logs, with no sidecars or DaemonSets. Optional Amazon Managed Prometheus scraper *(verify Fargate support)*. |
 | Images | Pulled from the ECR release cache (§3.2), not from Artifactory |
-| Secrets / DB | Secrets Manager synced to K8s Secrets at deploy time; RDS |
+| Secrets | Secrets Manager synced to K8s Secrets at deploy time |
+| Data stores | **RDS for PostgreSQL** (single-AZ in dev, Multi-AZ in prod), **ElastiCache** (Valkey/Redis OSS), **queue service per Q21** (SQS, Amazon MQ for RabbitMQ, or MSK), **S3** with versioning. App pods reach S3 via IRSA. No stateful pods run in the cluster. |
 | IaC | Terraform/OpenTofu (Q12): VPC wiring, cluster, Fargate profiles, access entries, pipeline, CodeBuild, OIDC trust, ALB/DNS, alarms |
 
 #### Why Fargate, now that the secondary CIDR is out
 
 | Option (no secondary CIDR) | Peak routable IPs, minimal | Ops burden | Notes |
 |---|---|---|---|
-| **EKS + Fargate** *(chosen)* | **~33** | **Lowest**: no nodes | IPs are exactly predictable. Slower pod start (~30–60 s), which is fine for rolling. No privileged pods or EBS volumes. Per-pod sizing. |
+| **EKS + Fargate** *(chosen)* | **~33** (+2–3 for data stores) | **Lowest**: no nodes | IPs are exactly predictable. Slower pod start (~30–60 s), which is fine for rolling. No privileged pods or EBS volumes. Per-pod sizing. |
 | Managed node groups + VPC CNI with `WARM_IP_TARGET=1` | ~35–40 | Medium: node AMIs, add-ons, scaling | Warm IPs per node plus DaemonSet pods add up |
 | EKS Auto Mode in primary subnets | uncertain | Low | IP allocation behaviour in small subnets *(verify)*. Can't be budgeted precisely yet. |
 
@@ -326,14 +388,23 @@ app pod count doubles briefly at peak.
 | CoreDNS (2) + LB controller (2) | 4 | 4 | 4 | 4 |
 | ALB (min 1/AZ, can scale to ~8) | 2 | 8 | 2 | 8 |
 | CodeBuild ENI (during deploys only) | 0 | 1 | 0 | 1 |
+| RDS PostgreSQL (single-AZ 1; Multi-AZ 2) | 1 | 1 | 2 | 2 |
+| ElastiCache (1 node; primary + replica 2) | 1 | 1 | 2 | 2 |
+| Queue broker (SQS 0; Amazon MQ / MSK 1–2) | 0–1 | 0–1 | 0–2 | 0–2 |
+| S3 (gateway endpoint / NAT, no ENIs) | 0 | 0 | 0 | 0 |
 | VPC endpoints (not a constraint, per you) | 0 | 0 | 0 | 0 |
-| **Total routable** | **18** | **33** | **26** | **41** |
+| **Total routable** | **20–21** | **35–36** | **30–32** | **45–47** |
 
 - Both profiles fit **NET-01 (≤ 50)**. In an **80-IP account** the minimal peak
-  leaves ~59% free and the HA peak ~49% free [NET-02]. Today it's ~130.
+  leaves ~55% free and the HA peak ~41% free [NET-02]. Today it's ~130.
+- The data-store lines only count if those services sit in the same VPC
+  subnets. If they live in a separate data VPC or subnets, subtract them.
+- An **RDS Blue/Green deployment** (used for Postgres major-version upgrades)
+  temporarily adds one or two DB instances. Schedule it outside app releases.
 - During the one-off **migration** from the old platform, both stacks can't sit
   in the same constrained account at once. The plan (§7, slice 5) uses a fresh
   account or VPC and a DNS cutover.
+
 
 ---
 
@@ -386,8 +457,10 @@ The winner doesn't change.
 | R2 | Self-maintained GHES/Artifactory availability only affects *builds and promotions*, never running apps or rollbacks | Holds as long as clusters pull from ECR (§3.2). If you choose direct Artifactory pulls, Artifactory needs HA and a production SLO. | — |
 | R3 | Cross-account role assumption from the tooling account is allowed by your AWS org policies (SCPs) | Use GHES OIDC federation instead | Q4 |
 | R4 | DB changes can follow expand/contract, with no destructive change in the same release | **Required for zero-downtime rollback**, under any design. It's app work and must be planned. | Q7 |
-| R5 | ECR auth friction is acceptable to customers (if option B is chosen) | Switch to option C (§2.5). Release and chart are unchanged. | Q19 |
-| R6 | Customer on-prem clusters can reach our customer-facing registry, or mirror from it | Offer a signed offline bundle for air-gapped sites [PORT-06] | Q20 |
+| R5 | ECR auth friction is acceptable to connected customers | Mirror tooling handles it. If not, add option C (a token-auth registry fed by the same GA copy). Release and chart are unchanged. | Q19 |
+| R6 | The app makes no internet calls at runtime | The air-gapped conformance test (§2.4) will catch it. Remove or make configurable any external calls. | Q20 |
+| R7 | The queue technology is available on-prem | If it's SQS, add a queue abstraction (SQS + AMQP backends) or migrate to RabbitMQ/Kafka. This is app work, so plan it in slice 1. | Q21 |
+| R8 | Redis, queue and object formats can follow additive-change rules | Same remedy as R4: it's required for zero-downtime rollback under any design | Q7 |
 
 ---
 
@@ -395,29 +468,30 @@ The winner doesn't change.
 
 | # | Slice | Proves | Size (1–2 engineers) |
 |---|---|---|---|
-| 1 | Chart with zero-downtime rules, digests, schema, adapters, signing. Conformance on kind: upgrade, **mixed-version** and **rollback** under load, broken-release auto-rollback. | ZDT-*, REL-*, PORT-01/07/08 | 2–3 wks |
+| 1 | Chart with zero-downtime rules, digests, schema, adapters, KMS-key signing. Conformance on kind **with Postgres, Redis, broker and S3-compatible store**: upgrade, **mixed-version** and **rollback** under load, broken-release auto-rollback. Queue portability decision (Q21). | ZDT-*, REL-*, PORT-01/07/08 | 3–4 wks |
 | 2 | Release account ECR + Artifactory → ECR copy step. Dev account: EKS + Fargate profiles, LB controller, CodePipeline/CodeBuild, GHES promote workflow. **Measure IPs.** | DEP-*, NET-01, §3.2 | 2–3 wks |
 | 3 | Nonprod with approvals, ALB-metric gate, auto-rollback, SSM record, drift job | DEP-02/09, ZDT-02/03, OPS-03 | 1 wk |
 | 4 | Deploy into an ~80-IP account (or a deliberately constrained VPC) | NET-02 | 2–3 days |
 | 5 | Prod migration: new stack in a fresh VPC/account, Route 53 weighted cutover, decommission the old stack | MIG-* | 1–2 wks |
-| 6 | Customer-facing release registry (option per §2.5), per-customer tokens, GA promotion, customer docs, scheduled **on-prem-distro** conformance | PORT-02/05/06, §2.5 | 1–2 wks |
+| 6 | ECR distribution account, per-customer IAM pull principals, GA promotion, **offline bundle + import script**, air-gapped conformance, customer docs, scheduled **on-prem-distro** conformance | PORT-02/05/06, §2.5 | 2 wks |
 
-About **8–10 weeks** to prod cutover. The app work for graceful shutdown,
-N/N+1 compatibility and expand/contract migrations is the main variable, and
+About **9–11 weeks** to prod cutover. The app work for graceful shutdown,
+N/N+1 compatibility across Postgres, Redis, queues and object storage, and
+(if needed) queue portability is the main variable, and
 it's needed for zero downtime under any design.
 
 ---
 
 ## 8. Remaining questions that matter
 
-1. **Customer-facing registry:** may we expose a release repo on our
-   Artifactory (option A)? Or do we go with ECR in a distribution account
-   (option B, recommended)? (§2.5, Q19)
-2. **Which on-prem Kubernetes distributions** do customers run (RKE2/k3s,
-   OpenShift, Tanzu, kubeadm…), and are any **air-gapped**? This sets the
-   conformance target and whether we need an offline bundle. (Q20)
-3. **ECR copy (recommended) or pull directly from Artifactory?** Choosing ECR
-   means your self-maintained Artifactory is never in the runtime path. (§3.2)
-4. **What stateful services does the app use** (Postgres, Redis, queues,
-   object storage)? This sets the customer adapters and the expand/contract
-   migration work. (Q7)
+1. **Which queue technology does the app use today**: SQS, RabbitMQ/Amazon MQ,
+   Kafka/MSK, or something else? This is the main portability risk for
+   on-prem customers. (§2.6, Q21)
+2. **Did your "yes" mean some customers are air-gapped?** I've assumed so and
+   added the offline bundle. Also, **which on-prem Kubernetes distributions**
+   do they run (OpenShift, RKE2/k3s, Tanzu, kubeadm…)? (Q20)
+3. **Is Redis a cache only, or does it hold sessions or other state** that
+   must survive a deploy? This sets how strict the Redis compatibility rule
+   needs to be. (§2.6)
+4. **Do the data stores sit in the same VPC subnets as the cluster** in our
+   accounts? If not, the IP budget drops by 2–6. (§3.6)
