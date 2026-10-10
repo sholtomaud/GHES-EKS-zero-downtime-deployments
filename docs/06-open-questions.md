@@ -23,8 +23,8 @@ answer changes, so prioritise accordingly.
 | Q23 | Does our **managed Windows build** allow WSL2 (Hyper-V platform), systemd in WSL, and rootless Podman? Any endpoint-security exclusions needed? | Viability of the whole local workflow; fallback to hosted dev envs. | **Answered (believed):** Yes. Slice 1 confirms on a real managed laptop, including the VPN route inside WSL2. |
 | Q24 | Do laptops need a **corporate proxy and/or internal CA** to reach Artifactory and AWS? | Bootstrap script and the `dev` image stage. | **Answered:** No proxy or internal CA needed. |
 | Q25 | Is the shared dev RDS the **same database the dev EKS environment uses**, or a separate one for laptops? | Blast radius of laptop activity; reset schedule. | **Answered (believed):** Yes, shared with the dev EKS environment. |
-| Q26 | Should dev be reset from a **masked/anonymised copy of clean** (needs a masking job and a data-owner sign-off), or from **synthetic fixtures** only (current proposal)? | Realism of dev data vs. a masking pipeline to build and own. | _unanswered_ |
-| Q27 | What are the **laptop / VPN client CIDR ranges** (as distinct from server ranges) for the RDS security-group prefix list? Does the VPN assign stable per-user addresses? | Width of the 5432 rule (local-development.md §5.5). | _unanswered_ |
+| Q26 | Should dev be reset from a **masked/anonymised copy of clean** (needs a masking job and a data-owner sign-off), or from **synthetic fixtures** only (current proposal)? | Realism of dev data vs. a masking pipeline to build and own. | **Answered:** Synthetic fixtures for now, locally and for the dev reset. Revisit only if synthetic data proves too thin. |
+| Q27 | What are the **laptop / VPN client CIDR ranges** (as distinct from server ranges) for the RDS security-group prefix list? Does the VPN assign stable per-user addresses? | Width of the 5432 rule (local-development.md §5.5). | **Answered:** The VPN is always on, so the source is just the VPN client pool. Take the CIDR from the network team at build time. Stable per-user addresses aren't needed: identity comes from the DB login. |
 
 ## Medium impact
 

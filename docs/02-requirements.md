@@ -127,7 +127,7 @@ written reason to omit. **MAY** = nice to have; don't build it unless it's free.
 |---|---|---|---|
 | DEV-01 | A developer starts the local stack (`api`, `agent`, `frontend`) with **one documented, editor-neutral command**. IDE integrations call that command; they don't duplicate it. | MUST | New starter succeeds from the README alone. |
 | DEV-02 | Local containers build from the **same Dockerfiles** as released images. Services not being edited run from released images **by digest**. | MUST | CI builds `dev` and `runtime` stages from one file; lint rejects mutable tags in compose. |
-| DEV-03 | The shared **dev** database is the default local target. Other targets require an explicit choice, and the active target is always displayed. | MUST | `make dev` with no config connects to dev and prints the target. |
+| DEV-03 | The local stack defaults to a **local database with synthetic data**. Connecting to the shared dev RDS requires an explicit, per-developer `.env.local` (connection settings only, gitignored). The active target is always displayed. | MUST | `make dev` without `.env.local` uses local; with it, dev; the banner matches both times. |
 | DEV-04 | Laptop credentials cannot run DDL against shared RDS databases (dev, clean). Clean is read-only from laptops. Schema migrations run locally only against an ephemeral database. | MUST | `CREATE TABLE` as the laptop role fails on dev and clean. |
 | DEV-05 | On a managed Windows laptop, clone to running stack takes ≤ 1 hour. | SHOULD | Timed onboarding with a new team member. |
 | DEV-06 | No database credentials in Git or images. Human DB access is short-lived and attributable to a person. | MUST | Secret scanning; IAM/DB role review. |
