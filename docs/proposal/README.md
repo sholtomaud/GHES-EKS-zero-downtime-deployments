@@ -1,3 +1,4 @@
 # Proposal (Phase 1)
 
-Empty until Phase 1. See [../05-proposal-brief.md](../05-proposal-brief.md) for required contents.
+The current proposal is [../../PROPOSAL.md](../../PROPOSAL.md). Detailed files listed in
+[../05-proposal-brief.md](../05-proposal-brief.md) are produced once the direction is approved.
