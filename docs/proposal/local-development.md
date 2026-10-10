@@ -11,12 +11,15 @@
 >
 > **Rev 3:** **synthetic data locally is the default for now.** A developer
 > connects to the shared dev RDS only when they need it, by adding a
-> **`./.env.local`** file (§5.2). The VPN is **always on**, so the SG source is
+> **`./.env.local`** file (§5.2; its role changed in rev 4). The VPN is **always on**, so the SG source is
 > simply the VPN client pool, and the SSM fallback is gone (§5.5).
 >
 > **Rev 4:** local synthetic data comes from a **generator script**. No data
 > files are stored in the repo (§5.3). The **dev RDS holds the "dirty" test
-> data**, and `.env.local` points at it. Dev is **not reset to synthetic data**:
+> data**, and `make dev DB=dev` connects to it. **`./.env.local` is for the
+> local database only.** For RDS, the script fetches the URL and password from
+> Secrets Manager and passes them straight into the containers' environment,
+> with no file (§5.2.1). Dev is **not reset to synthetic data**:
 > its contents are the point (§5.2). Q28 asks whether that dirty data contains
 > real personal data, because the answer changes how laptops may connect.
 
@@ -53,8 +56,11 @@ The recommended setup on each laptop:
 - **The repo cloned inside the WSL filesystem** (`~/src/...`), never under `/mnt/c`.
 
 `make dev` with no configuration runs against a **local Postgres populated by a
-seed script with generated synthetic data**. Adding a `./.env.local` file
-switches the stack to the **shared dev RDS with the dirty test data**. Either way, every start prints which database is in use.
+seed script with generated synthetic data**, configured by `./.env.local`.
+`make dev DB=dev` connects the
+stack to the **shared dev RDS with the dirty test data**. The script fetches
+the URL and password with your AWS login and passes them into the containers'
+environment, with no config file. Either way, every start prints which database is in use.
 The clean database holds real data. Laptops can only query it, read-only,
 through each person's own login, and it's never copied off RDS. Local code may
 run migrations only against the local Postgres.
@@ -79,7 +85,7 @@ flowchart LR
     dev[(RDS dev · dirty test data<br/>shared with dev EKS<br/>DML only from laptops)]
     clean[(RDS clean<br/>real data · query only<br/>named IAM logins)]
   end
-  api & agent -.->|with .env.local<br/>always-on VPN| sg -.-> dev
+  api & agent -.->|make dev DB=dev<br/>always-on VPN| sg -.-> dev
   shell -.->|DB=clean| sg -.-> clean
   art[(Artifactory<br/>base images, released<br/>images by digest)] --> compose
 ```
@@ -182,7 +188,7 @@ app/
 ├── compose.db-local.yaml         # adds ephemeral postgres; used only when DB=local
 ├── Makefile                      # canonical entry point; `make help` lists targets
 ├── .env.example                  # non-secret defaults; copy to .env (gitignored)
-├── .env.local.example            # shape of .env.local (shared dev RDS); the real file is gitignored
+├── .env.local.example            # local-DB settings; copied to .env.local (gitignored) on first `make dev`
 ├── .gitattributes                # eol=lf
 ├── .devcontainer/
 │   ├── devcontainer.json         # dockerComposeFile: ../compose.yaml; service: workspace
@@ -224,17 +230,16 @@ as every environment (AGENTS.md rule 7) [DEV-02].
 | Target | Does | Notes |
 |---|---|---|
 | `make bootstrap` | One-time WSL setup (`scripts/dev/bootstrap-wsl.sh`). Idempotent. | Checks repo isn't under `/mnt/c`, and that systemd and the Podman socket are running |
-| `make dev` | No `.env.local`: starts local Postgres, runs migrations, runs the seed generator, then `compose up --build`. With `.env.local`: `scripts/dev/up.sh` checks your AWS login, fetches the DB password from Secrets Manager, then runs `compose up --build` against dev RDS (§5.2.1). | Prints a banner with the DB target |
-| `make dev DB=local` | Forces the local database even if `.env.local` exists | Quick switch back without deleting the file |
-| `make env-local` | Writes `.env.local` for the shared dev RDS (§5.2) | Needs `aws sso login` and the DevDatabaseAccess permission set |
+| `make dev` | Creates `.env.local` from `.env.local.example` if missing, starts local Postgres with it, runs migrations and the seed generator, then `compose up --build` | Prints a banner with the DB target |
+| `make dev DB=dev` | `scripts/dev/up.sh`: checks your AWS login, fetches URL + password from Secrets Manager, starts `api`/`agent` with them in their environment (§5.2.1) | Needs the DevDatabaseAccess permission set. Nothing written to disk. |
 | `make db-shell` | `psql` against whichever DB the stack uses: local, or dev as **you** (IAM auth token) | Attributable, short-lived |
 | `make db-shell DB=clean` | `psql` as **you** (IAM auth token), read-only, against clean | The only laptop path to clean. Query only (§5.4). |
-| `make down` / `make clean` | Stop / remove containers and volumes | `clean` also deletes the local DB volume and `$XDG_RUNTIME_DIR/app` |
+| `make down` / `make clean` | Stop / remove containers and volumes | `clean` also deletes the local DB volume |
 | `make test`, `make lint` | The same commands CI runs, in the workspace container | Same versions as CI |
 | `make pin-release VERSION=x` | Write released image digests into `.env` | Used with `SRC=` |
 | `make help` | Lists targets | The default target |
 
-VS Code `tasks.json` exposes `dev`, `dev: local db`, `env-local`, `down`, `test`, `db-shell`, `db-shell: clean`.
+VS Code `tasks.json` exposes `dev`, `dev: dirty data (RDS)`, `down`, `test`, `db-shell`, `db-shell: clean`.
 Each one is `"command": "make <target>"`.
 
 ### Dev Container shape
@@ -265,52 +270,53 @@ else changes.
 
 ---
 
-## 5. Databases: local synthetic by default, dev via `.env.local`, clean query-only
+## 5. Databases: local synthetic by default, dev RDS on request, clean query-only
 
 ### 5.1 The three targets
 
 | `DB=` | Where | Laptop access | Can run DDL? | Default? | Use for |
 |---|---|---|---|---|---|
-| **`local`** | Podman container on the laptop, populated by the seed generator, discarded on `make down` | Owner | **Yes** | **Yes** (no `.env.local`) | Everyday feature work, migrations, destructive experiments, working offline |
-| `dev` | RDS, dev account. **The "dirty" test data**: messy, realistic data for testing against. **Shared with the dev EKS environment** (Q25). | Only with `.env.local`. App containers: `app_dev_local`, DML only. People: own IAM login, DML only. | **No** | No | Testing against messy, realistic data; integration with what's deployed in the dev environment |
+| **`local`** | Podman container on the laptop, populated by the seed generator, discarded on `make down` | Owner | **Yes** | **Yes** (`make dev`) | Everyday feature work, migrations, destructive experiments, working offline |
+| `dev` | RDS, dev account. **The "dirty" test data**: messy, realistic data for testing against. **Shared with the dev EKS environment** (Q25). | Only with `make dev DB=dev`. App containers: `app_dev_local`, DML only. People: own IAM login, DML only. | **No** | No | Testing against messy, realistic data; integration with what's deployed in the dev environment |
 | `clean` | RDS, dev account. **Real data** (Q22). | **People only**, each with their own IAM login mapped to `clean_reader` (SELECT only). No app containers, no shared credential. | No | No | Querying real data to understand a bug or check an assumption |
 
-### 5.2 Choosing the target: `.env.local` [DEV-03]
+### 5.2 Choosing the target: `make dev` or `make dev DB=dev` [DEV-03]
 
-For now, generated synthetic data on the laptop is the default. The dev RDS,
-with its dirty test data, is opt-in per developer by adding one file.
+For now, generated synthetic data on the laptop is the default. Connecting to
+the dirty data on dev RDS is one explicit flag. **For RDS no config file is
+involved: the script fetches the URL and password at start and passes them
+straight into the containers' environment.** Nothing about the RDS connection
+is written to disk. `./.env.local` configures only the local database.
 
-1. **No file, local data.** `make dev` with no `.env.local` starts the local
-   Postgres and populates it with the seed generator (§5.3). It needs no AWS access, so a new starter is
-   productive before their database access is granted.
-2. **`.env.local` points the stack at the dirty data on dev RDS.** compose loads it as an
-   optional `env_file` for `api` and `agent` only *(verify `env_file.required:
-   false` on the compose version we pin)*. It holds **connection settings, not
-   credentials**:
+1. **`make dev`: local data, configured by `./.env.local`.** Starts the local
+   Postgres and populates it with the seed generator (§5.3). It needs no AWS
+   access, so a new starter is productive before their database access is
+   granted. `.env.local` holds only throwaway local settings, and is created
+   from the committed `.env.local.example` on first run:
 
    ```sh
-   # .env.local: written by `make env-local`; gitignored; never committed
-   DB_TARGET=dev
-   PGHOST=<dev-rds-endpoint>        # the dirty-data RDS instance; resolves over the VPN
+   # .env.local: local database only; gitignored; safe to edit or delete
+   PGHOST=postgres
    PGPORT=5432
    PGDATABASE=app
-   PGUSER=app_dev_local
-   PGSSLMODE=verify-full
-   PGSSLROOTCERT=/etc/ssl/rds/global-bundle.pem
-   DB_SECRET_ID=dev/app_dev_local   # make fetches the password at start (§5.4)
+   PGUSER=app
+   PGPASSWORD=local          # the throwaway container's password, not a real credential
+   PGSSLMODE=disable
+   SEED=42                   # seed generator: deterministic data
+   ROWS=small                # seed generator: small | large
    ```
 
-   "We provide the file" means **`make env-local` generates it** from the
-   developer's SSO session, rather than someone sending it out. There's no
-   password in it, so a copied or leaked file grants nothing on its own. If you
-   would rather hand out a file containing a password, make it a **per-person**
-   login so it stays attributable and revocable, never a shared one [DEV-06].
+   It never holds an RDS URL or password.
+2. **`make dev DB=dev`: the dirty data on dev RDS.** Runs `scripts/dev/up.sh`
+   (§5.2.1). The script logs in to AWS if needed, fetches the connection
+   secret, and starts `api` and `agent` with it in their environment.
 3. **Every start shows the target.** `make dev` prints
-   `DB: local (generated, SEED=42)` or `DB: dev (dirty test data, shared with dev EKS, <endpoint>)`, and
-   the frontend shows a matching corner badge. Nobody is unsure which database
+   `DB: local (generated, SEED=42)` or
+   `DB: dev (dirty test data, shared with dev EKS, <endpoint>)`, and the
+   frontend shows a matching corner badge. Nobody is unsure which database
    they're on.
-4. **The frontend never sees `.env.local`.** Only `api` and `agent` load it,
-   and no variable in it uses a client-exposed prefix (e.g. `VITE_`), so DB
+4. **The frontend never gets DB settings.** Only `api` and `agent` receive
+   them, and no variable uses a client-exposed prefix (e.g. `VITE_`), so DB
    settings can't end up in a browser bundle.
 5. **Clean isn't a place to run the app.** The stack can't target it at all.
    Clean can only be queried by a named person, read-only.
@@ -321,41 +327,60 @@ with its dirty test data, is opt-in per developer by adding one file.
    fix is a snapshot of dev to restore from, not overwriting it with synthetic
    data.
 
-**Later:** once the generator and dev access are settled, the default can flip
-to dev by having `make bootstrap` run `make env-local`. Nothing else changes.
+**Later:** to make dev the default, change `DB ?= local` to `DB ?= dev` in the
+Makefile. Nothing else changes.
 
-#### 5.2.1 What `make dev` does when `.env.local` exists
+#### 5.2.1 What `make dev DB=dev` does
 
-Yes: one script in the repo, `scripts/dev/up.sh`, does it all, and `make dev`
-calls it. It uses the developer's AWS login to fetch the password from Secrets
-Manager, then starts the containers with the URL and password. It's about 30
-lines of shell:
+One script in the repo, `scripts/dev/up.sh`. It uses the developer's AWS login
+to fetch the URL and password from Secrets Manager, exports them **in its own
+process only**, and starts the containers. Compose passes them into the
+containers' environment. About 20 lines of shell:
 
 ```sh
 # scripts/dev/up.sh (sketch, not final)
 set -euo pipefail
-set -a; . ./.env.local; set +a                        # URL parts + DB_SECRET_ID, no password
+SECRET_ID="dev/app_dev_local"                          # a name, not a secret; same for everyone
 
 aws sts get-caller-identity >/dev/null 2>&1 \
-  || aws sso login --profile "${AWS_PROFILE:-dev}"    # browser opens once; cached ~8-12 h
+  || aws sso login --profile "${AWS_PROFILE:-dev}"     # browser once; cached for the SSO session
 
-run="${XDG_RUNTIME_DIR}/app"; install -d -m 700 "$run"
-aws secretsmanager get-secret-value --secret-id "$DB_SECRET_ID" \
-    --query SecretString --output text \
-  | jq -r '"PGPASSWORD=\(.password)"' > "$run/db.env"  # tmpfs, never in the repo
-chmod 600 "$run/db.env"
+secret=$(aws secretsmanager get-secret-value --secret-id "$SECRET_ID" \
+           --query SecretString --output text)         # JSON: host, port, dbname, username, password
+export PGHOST=$(jq -r .host <<<"$secret")     PGPORT=$(jq -r .port <<<"$secret")
+export PGDATABASE=$(jq -r .dbname <<<"$secret") PGUSER=$(jq -r .username <<<"$secret")
+export PGPASSWORD=$(jq -r .password <<<"$secret")
+export PGSSLMODE=verify-full PGSSLROOTCERT=/etc/ssl/rds/global-bundle.pem
+unset secret
 
 echo "DB: dev (dirty test data) ${PGUSER}@${PGHOST}:${PGPORT}/${PGDATABASE}"
-DB_ENV_FILE="$run/db.env" podman compose up --build   # compose reads env_file: ${DB_ENV_FILE}
+exec podman compose up --build                         # compose passes PG* to api + agent
+```
+
+```yaml
+# compose.yaml (excerpt). `make dev` runs `compose --env-file .env.local`.
+# `up.sh` doesn't pass .env.local, and exported shell variables win anyway.
+services:
+  api:
+    environment:
+      PGHOST: ${PGHOST}
+      PGPASSWORD: ${PGPASSWORD}
+      # ... PGPORT, PGDATABASE, PGUSER, PGSSLMODE, PGSSLROOTCERT the same way
 ```
 
 | Step | Why this way |
 |---|---|
-| URL in `.env.local`, password from Secrets Manager | The file can be handed around or regenerated freely. Rotating the password needs no change on any laptop. |
+| URL and password both come from one Secrets Manager secret | Nothing to hand out or keep in sync. Moving the instance or rotating the password needs no change on any laptop. |
 | `aws sso login` only if the session has expired | One browser login per working day, not per start |
-| Password written to `$XDG_RUNTIME_DIR` (tmpfs) | Never in the repo directory, so it can't be committed by accident, and it disappears when WSL shuts down |
-| Passed to `api`/`agent` as an `env_file` | The same shape as the K8s Secret in clusters, so the app code path is identical (PROPOSAL.md §2.2) |
-| Same script whether you start from the terminal, a VS Code task, or the Dev Container | One way to start the stack [DEV-01] |
+| Exported in the script's process, not written to a file | Nothing on disk to commit, copy or leave behind. It's gone when the stack stops. |
+| Local settings in `./.env.local`, RDS settings from the script's environment | Plain `make dev` needs no AWS at all. Compose gives exported shell variables precedence over `--env-file` values, so RDS mode can't accidentally pick up local settings *(verify on the compose version we pin)*. |
+| Same env-var shape as the K8s Secret in clusters | The app code path is identical (PROPOSAL.md §2.2) |
+| Same script from a terminal, a VS Code task or the Dev Container | One way to start the stack [DEV-01] |
+
+**One thing to know:** environment variables are visible to the same Linux user,
+via `podman inspect` and `/proc`. On a single-user laptop that's the same
+exposure as any running process's memory. It's acceptable for a DML-only dev
+role, but not a reason to put a more powerful credential there.
 
 **Podman or Docker?** The compose file and script work with either engine
 (`podman compose` / `docker compose`). The proposal uses Podman to avoid the
@@ -390,14 +415,14 @@ later fail on a schema it didn't create. So:
   testing is still possible. Make it **deliberately messy where it matters**:
   nulls, unicode, boundary values, duplicates the app must tolerate. Then local
   work catches some of what the dirty data would. The generator runs only
-  against `local`: `make seed` refuses when `.env.local` is active.
+  against `local`: `make seed` refuses unless `DB=local`.
 
 ### 5.4 Credentials and clean-data controls [DEV-06, DEV-08]
 
 | Who | Target | How | Stored |
 |---|---|---|---|
 | People (`psql`, GUI client) | dev, clean | **RDS IAM database authentication**: `aws sso login`, then `make db-shell` generates a token (valid 15 min for *connecting*; the session outlives it). One Postgres login per person, granted `rds_iam`. | Nowhere: generated per connection |
-| Local app containers (`api`, `agent`) | dev only, when `.env.local` exists | `app_dev_local` password from **Secrets Manager** (`DB_SECRET_ID` in `.env.local`), fetched by `scripts/dev/up.sh` using your SSO session; rotated | `$XDG_RUNTIME_DIR/app/db.env` (tmpfs, mode 0600, gone on WSL shutdown), injected as env/file exactly as the K8s Secret is in clusters |
+| Local app containers (`api`, `agent`) | dev only, with `make dev DB=dev` | `app_dev_local` URL + password from **Secrets Manager**, fetched by `scripts/dev/up.sh` using your SSO session; rotated | **Not stored.** Held in the script's process and passed to the containers' environment, the same shape as the K8s Secret in clusters |
 
 **Clean is query-only, not copy.** Postgres can't technically stop someone who
 can `SELECT` from saving the result. So the controls are about making that
@@ -419,10 +444,11 @@ deliberate, attributable and visible, not impossible:
   identical everywhere. That's acceptable for dev **only if the dirty data
   holds no real personal data (Q28).** If it does, dev needs the same
   per-person, audited access as clean: an IAM-authenticated login per
-  developer, with token refresh in the app or a per-person password in
-  `.env.local`. If the app gains IAM auth for prod (SEC-05), switch local over too.
-- **No credentials in Git or images** [SEC-02]. `.env` and `.env.local`
-  are gitignored (and `.env.local` holds no password anyway), and secret scanning runs in CI.
+  developer, with token refresh in the app or a per-person secret
+  that `up.sh` fetches instead. If the app gains IAM auth for prod (SEC-05), switch local over too.
+- **No RDS credentials in Git, images or files on the laptop** [SEC-02].
+  They're fetched at start and held only in process environments. `.env` (image
+  digests) and `.env.local` (local DB only) are gitignored, and secret scanning runs in CI.
 - **Permission sets:** "DevDatabaseAccess" allows `rds-db:connect` to your dev
   user and `secretsmanager:GetSecretValue` on the one laptop secret.
   "CleanDataReader" allows `rds-db:connect` to your clean user only. Neither
@@ -477,7 +503,7 @@ Multi-AZ). It doesn't change the verdict for any profile.
 |---|---|---|
 | DEV-01 One documented entry point | `make dev`; tasks and Dev Container call it | New-starter exercise: README only |
 | DEV-02 Same Dockerfiles; non-edited services by digest | `dev` stage of each service Dockerfile; `make pin-release` | CI builds `dev` and `runtime` from the same file; lint rejects `:latest` in compose |
-| DEV-03 Local synthetic by default; shared dev RDS only with `.env.local`; target always shown | Makefile target selection; banner; `make env-local` | `make dev` with no `.env.local` uses local; with it, dev; banner matches both times |
+| DEV-03 Local synthetic by default (configured by `.env.local`); shared dev RDS only with `make dev DB=dev`; target always shown | `DB ?= local` in Makefile; `.env.local`; `up.sh`; banner | `make dev` uses local; `make dev DB=dev` uses dev; banner matches both times; no RDS URL or password in any file on the laptop |
 | DEV-04 No laptop DDL on shared DBs | Postgres grants on `app_dev_local`, personal dev logins, `clean_reader` | Test: `CREATE TABLE` as each laptop role fails on dev and clean |
 | DEV-05 Clone to running stack < 1 h on Windows | `make bootstrap`, Dev Container | Timed onboarding of a new team member |
 | DEV-06 No long-lived DB creds on laptops for humans; none in Git | IAM DB auth; Secrets Manager fetch; `.gitignore` | IAM review; secret scanning |
@@ -517,8 +543,8 @@ Unverified items, which slice 1 must check against current docs and cite:
 |---|---|---|---|
 | 1 | On **one real managed Windows laptop**: WSL2 + Podman + compose + Dev Container for `api` only, with `DB=local`. Settle the keep-id/user combination. **Prove the VPN route reaches RDS from inside a rootless container in WSL.** | R1, R3, DEV-07 | 2–3 days |
 | 2 | Dev account: two RDS instances, VPN-pool prefix list + SGs, `force_ssl`, roles and grants, IAM-only clean with pgaudit, two SSO permission sets, one Secrets Manager secret. In IaC. | DEV-04, DEV-06, DEV-08, §5.5 | 3–4 days |
-| 3 | `make dev` for api + agent + frontend: local synthetic by default, dev RDS via `make env-local`/`.env.local`; `pin-release`/`SRC=`; tasks.json, launch.json; banner | DEV-01/02/03 | 3–4 days |
-| 4 | Seed generator (deterministic, sized, deliberately messy), `make seed`, refusal when `.env.local` is active | §5.3, DEV-03 | 2–3 days |
+| 3 | `make dev` for api + agent + frontend: local synthetic by default, dev RDS via `make dev DB=dev` (`up.sh`); `pin-release`/`SRC=`; tasks.json, launch.json; banner | DEV-01/02/03 | 3–4 days |
+| 4 | Seed generator (deterministic, sized, deliberately messy), `make seed`, refusal unless `DB=local` | §5.3, DEV-03 | 2–3 days |
 | 5 | Timed onboarding with a new team member; fix what they hit | DEV-05 | 1 day |
 
 About **2–3 weeks** for one engineer. It can run in parallel with PROPOSAL.md
