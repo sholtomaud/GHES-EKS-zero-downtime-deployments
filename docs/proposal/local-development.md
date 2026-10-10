@@ -229,7 +229,7 @@ as every environment (AGENTS.md rule 7) [DEV-02].
 | `make env-local` | Writes `.env.local` for the shared dev RDS (§5.2) | Needs `aws sso login` and the DevDatabaseAccess permission set |
 | `make db-shell` | `psql` against whichever DB the stack uses: local, or dev as **you** (IAM auth token) | Attributable, short-lived |
 | `make db-shell DB=clean` | `psql` as **you** (IAM auth token), read-only, against clean | The only laptop path to clean. Query only (§5.4). |
-| `make down` / `make clean` | Stop / remove containers and volumes | `clean` also deletes `.dev/` |
+| `make down` / `make clean` | Stop / remove containers and volumes | `clean` also deletes the local DB volume and `$XDG_RUNTIME_DIR/app` |
 | `make test`, `make lint` | The same commands CI runs, in the workspace container | Same versions as CI |
 | `make pin-release VERSION=x` | Write released image digests into `.env` | Used with `SRC=` |
 | `make help` | Lists targets | The default target |
