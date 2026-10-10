@@ -47,6 +47,7 @@ See [ADR-0001](docs/adr/0001-fixed-constraints.md).
 | [docs/04-solution-space.md](docs/04-solution-space.md) | Candidate options per decision, with known trade-offs. Not decisions. |
 | [docs/05-proposal-brief.md](docs/05-proposal-brief.md) | Exactly what the proposal must contain, and its template. |
 | [docs/06-open-questions.md](docs/06-open-questions.md) | Facts we still need from humans. |
+| [docs/proposal/local-development.md](docs/proposal/local-development.md) | Proposed local development workflow (Windows/WSL, Podman, VS Code, dev vs clean DB). |
 | [docs/adr/](docs/adr/) | Architecture Decision Records: accepted and proposed decisions. |
 | [scripts/inventory-ip-usage.sh](scripts/inventory-ip-usage.sh) | Phase 0 tool: break down IP consumption in an existing VPC/cluster. |
 

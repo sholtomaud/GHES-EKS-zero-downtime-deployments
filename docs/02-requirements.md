@@ -117,6 +117,23 @@ written reason to omit. **MAY** = nice to have; don't build it unless it's free.
 | MIG-02 | Prod cutover is zero-downtime (DNS/LB-level switch with tested rollback). | MUST | Cutover rehearsal in nonprod. |
 | MIG-03 | The old platform's components are fully removed after acceptance, with IP/cost savings measured. | MUST | Before/after inventory. |
 
+## DEV: Local development (proposed)
+
+> **Proposed with [ADR-0003](adr/0003-local-development-workflow.md); not part of
+> the contract until a human accepts that ADR.** See
+> [proposal/local-development.md](proposal/local-development.md).
+
+| ID | Requirement | Pri | Verification |
+|---|---|---|---|
+| DEV-01 | A developer starts the local stack (`api`, `agent`, `frontend`) with **one documented, editor-neutral command**. IDE integrations call that command; they don't duplicate it. | MUST | New starter succeeds from the README alone. |
+| DEV-02 | Local containers build from the **same Dockerfiles** as released images. Services not being edited run from released images **by digest**. | MUST | CI builds `dev` and `runtime` stages from one file; lint rejects mutable tags in compose. |
+| DEV-03 | The local stack defaults to a **local database populated by a seed-generator script** (synthetic, deterministic; no data files in the repo), configured by a gitignored `.env.local` holding local settings only. Connecting to the shared dev RDS (dirty test data) requires an explicit choice (`make dev DB=dev`). Connection details are fetched at start and passed to the containers' environment, never written to a file on the laptop (including `.env.local`). The active target is always displayed. | MUST | `make dev` uses local; `make dev DB=dev` uses dev; the banner matches both times. |
+| DEV-04 | Laptop credentials cannot run DDL against shared RDS databases (dev, clean). Clean is read-only from laptops. Schema migrations run locally only against an ephemeral database. | MUST | `CREATE TABLE` as the laptop role fails on dev and clean. |
+| DEV-05 | On a managed Windows laptop, clone to running stack takes ≤ 1 hour. | SHOULD | Timed onboarding with a new team member. |
+| DEV-06 | No database credentials in Git or images. Human DB access is short-lived and attributable to a person. | MUST | Secret scanning; IAM/DB role review. |
+| DEV-07 | The local workflow needs no paid container-desktop licence. | SHOULD | Onboarding doc lists no paid tool. |
+| DEV-08 | The **clean** database holds real data. From laptops it is **query-only**: named people only (no shared credential), read-only, audited, and never copied (no dumps, never used to seed local or dev databases). | MUST | Password login to clean fails; reads appear in the audit log by person; no seed or reset path reads from clean. |
+
 ---
 
 ## Acceptance criteria for the whole programme
