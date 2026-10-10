@@ -200,7 +200,7 @@ restarts and **rollback**.
 | Option | Runtime dependency | Pull auth on Fargate | Network from workload VPCs | Verdict |
 |---|---|---|---|---|
 | **ECR release cache** *(chosen)* | ECR: managed, regional, highly available | Fargate pod execution role; no pull secrets | ECR API/endpoints only; no route to the tooling account | Chosen |
-| Pull directly from Artifactory on EC2 | The Artifactory instance, on every pod start | `imagePullSecrets` in every namespace, rotated | Cross-account private route to the tooling VPC from every workload VPC | Only worth it if Artifactory is HA *and* already privately reachable from all workload VPCs (Q29) |
+| Pull directly from Artifactory on EC2 | The Artifactory instance, on every pod start | `imagePullSecrets` in every namespace, rotated | Cross-account private route to the tooling VPC from every workload VPC | Only worth it if Artifactory is HA *and* already privately reachable from all workload VPCs |
 
 **Design:**
 - The GHES promote workflow, running on a runner in the tooling account,
@@ -208,7 +208,7 @@ restarts and **rollback**.
   (`crane`/`oras` copy). This covers the 8 images, the OCI chart, and the
   signatures/SBOM/provenance. Digests are unchanged, so "deploy by digest"
   still identifies exactly what Artifactory holds [REL-01/02].
-- ECR lives in one **release account**, or in the tooling account (Q29).
+- ECR lives in the tooling account.
   Workload accounts pull cross-account through a repository policy granting
   their Fargate pod-execution roles.
 - The previous releases stay in ECR, so **rollback never needs Artifactory**.
@@ -354,11 +354,10 @@ winner doesn't change.
 | # | Assumption | If wrong | Q |
 |---|---|---|---|
 | R1 | Services tolerate N/N+1 running together | The CI mixed-version test (§2.4) will catch it. Fix the API compatibility, or fall back to blue/green. | Q1 |
-| R2 | The tooling account can push to ECR and start pipelines in workload accounts (cross-account IAM) | Standard IAM. Confirm the account layout. | Q29 |
-| R3 | AWS IAM can trust GHES OIDC tokens. IAM must fetch the issuer's discovery document over HTTPS, which a private GHES on EC2 may not expose. | Publish the OIDC discovery docs where IAM can reach them, or use runner instance roles in the tooling account to assume per-environment trigger roles | Q4, Q29 |
-| R4 | DB changes can follow expand/contract, with no destructive change in the same release | **Required for zero-downtime rollback**, under any design. It's app work and must be planned. | Q7 |
-| R5 | ECR auth friction is acceptable to customers (if option B is chosen) | Switch to option C (§2.5). Release and chart are unchanged. | Q19 |
-| R6 | Customer on-prem clusters can reach our customer-facing registry, or mirror from it | Offer a signed offline bundle for air-gapped sites [PORT-06] | Q20 |
+| R2 | AWS IAM can trust GHES OIDC tokens. IAM must fetch the issuer's discovery document over HTTPS, which a private GHES on EC2 may not expose. | Publish the OIDC discovery docs where IAM can reach them, or use runner instance roles in the tooling account to assume per-environment trigger roles | Q4 |
+| R3 | DB changes can follow expand/contract, with no destructive change in the same release | **Required for zero-downtime rollback**, under any design. It's app work and must be planned. | Q7 |
+| R4 | ECR auth friction is acceptable to customers (if option B is chosen) | Switch to option C (§2.5). Release and chart are unchanged. | Q19 |
+| R5 | Customer on-prem clusters can reach our customer-facing registry, or mirror from it | Offer a signed offline bundle for air-gapped sites [PORT-06] | Q20 |
 
 ---
 
@@ -387,8 +386,6 @@ it's needed for zero downtime under any design.
 2. **Which on-prem Kubernetes distributions** do customers run (RKE2/k3s,
    OpenShift, Tanzu, kubeadm…), and are any **air-gapped**? This sets the
    conformance target and whether we need an offline bundle. (Q20)
-3. **Tooling account layout:** which account and VPC host GHES and Artifactory,
-   is Artifactory HA, and is GHES's OIDC issuer reachable by AWS IAM? (Q29)
-4. **What stateful services does the app use** (Postgres, Redis, queues,
+3. **What stateful services does the app use** (Postgres, Redis, queues,
    object storage)? This sets the customer adapters and the expand/contract
    migration work. (Q7)

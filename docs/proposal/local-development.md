@@ -241,11 +241,43 @@ Opening the folder in VS Code gives you the toolchain. **Starting the stack is
 still `make dev`**, from the integrated terminal or a task. There's one way to
 run the stack, whether or not you use the Dev Container.
 
-VS Code Dev Containers with Podman works when `dev.containers.dockerPath` is set
-to `podman` (or `docker` is a shim to the Podman socket), but the official docs
-treat Podman as a secondary engine *(verify)*. If slice 1 hits blocking issues,
-the fallback is option A for the toolchain plus the same `compose.yaml`. Nothing
-else changes.
+### VS Code with Podman
+
+VS Code's Dev Containers extension calls `docker` by default. Two settings point
+it at Podman instead. They go in the developer's VS Code **user settings for
+the WSL remote**, not in the repo, so nobody else's engine choice is forced:
+
+```jsonc
+// VS Code settings (Remote [WSL: Ubuntu-24.04])
+{
+  "dev.containers.dockerPath": "podman",
+  "dev.containers.dockerComposePath": "docker-compose"   // v2 binary, talking to the Podman socket
+}
+```
+
+In the repo, `devcontainer.json` carries the rootless-Podman UID fix, so files
+created in the container stay owned by the developer:
+
+```jsonc
+  "runArgs": ["--userns=keep-id"],   // for compose-based configs: `userns_mode: keep-id` on the workspace service
+  "containerUser": "dev",
+  "updateRemoteUserUID": true
+```
+
+Day to day:
+
+1. Open the repo folder in WSL (`code .` from the WSL terminal, or *WSL: Open
+   Folder*).
+2. Run *Dev Containers: Reopen in Container*. VS Code builds the `workspace`
+   service from `compose.yaml` with Podman and attaches to it.
+3. Run `make dev` from the integrated terminal, or *Tasks: Run Task → dev*.
+4. Run `make down` when finished.
+
+Podman is a community-supported engine for Dev Containers, not the default
+*(verify current status)*. That's why slice 1 (§9) proves this exact setup on
+one managed laptop first. If it doesn't hold up, the fallback is: no Dev
+Container, the toolchain installed in WSL, and the same `compose.yaml` and
+`make dev`. Nothing else changes.
 
 ---
 
