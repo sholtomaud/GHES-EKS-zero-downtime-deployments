@@ -39,7 +39,7 @@ written reason to omit. **MAY** = nice to have; don't build it unless it's free.
 | ID | Requirement | Pri | Verification |
 |---|---|---|---|
 | ZDT-01 | A normal release causes **zero failed user requests** (5xx or connection errors attributable to the release). | MUST | Load test at representative RPS during release; error count = 0. |
-| ZDT-02 | Rollback to the previous release completes in ≤ 5 minutes and is a single, rehearsed command or approval. | MUST | Timed rollback drill each quarter. |
+| ZDT-02 | Rollback to the previous release has **zero downtime**, completes in ≤ 5 minutes, and is a single, rehearsed command or approval. | MUST | Timed rollback drill under load each quarter: 0 failed requests. |
 | ZDT-03 | A failed health check during release aborts automatically and leaves (or returns) traffic on the previous version. | MUST | Fault-injection test with a deliberately broken release. |
 | ZDT-04 | The proposal decides **rolling vs blue/green** explicitly, with reasons. If blue/green, it states whether the switch is **per service or whole stack**, based on how coupled the services are (see open questions). | MUST | ADR. |
 | ZDT-05 | Database/schema changes follow expand/contract. Release N must run against schema N-1 and N+1 against N. | MUST | Migration CI test: old app on new schema. |
