@@ -529,7 +529,7 @@ Multi-AZ). It doesn't change the verdict for any profile.
 |---|---|---|---|
 | R1 | ~~Laptops can reach the dev VPC~~ **Confirmed** (Q21). VPN is always on. Remaining: the VPN route also reaches *inside WSL2* | `networkingMode=mirrored`; failing that, the VPN vendor's WSL guidance | Q21 |
 | R2 | **Resolved: clean holds real data** (Q22). Design changed: query-only, named and audited access; generated local data; nothing copied from clean. | — | Q22, Q26 |
-| R9 | **Confirmed: no PII on dev** (Q28), but it holds samples of actual data. If PII ever lands there,  laptop access to dev moves from the shared `app_dev_local` role to per-person, audited logins (as clean), and the app containers must use them | Q28 |
+| R9 | **Confirmed: no PII on dev** (Q28), but it holds samples of actual data. | If PII ever lands there, laptop access to dev moves from the shared `app_dev_local` role to per-person, audited logins (as clean), and the app containers must use them | Q28 |
 | R3 | WSL2 + rootless Podman + Dev Containers works on our managed Windows build (endpoint security, Hyper-V policy). **Believed yes** (Q23). | Slice 1 will show it. Fallback: option A for toolchain, then option F if WSL itself is blocked. | Q23 |
 | R4 | **Resolved:** no corporate CA or proxy needed (Q24) | — | Q24 |
 | R5 | The app reads DB settings from env/file (hosting contract §2.2), so local and cluster delivery are identical | Small app change, needed for portability anyway | Q7 |
