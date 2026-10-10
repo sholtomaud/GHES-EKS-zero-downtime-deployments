@@ -56,8 +56,8 @@ reproducibility 15, maintenance 10, licence 5 (total /500).
    fetch the URL and password from Secrets Manager. It passes them straight
    into the `api`/`agent` containers' environment, with nothing written to disk,
    and connects them to the **shared dev RDS with the dirty test data** using a
-   DML-only role (per-person and audited instead if that data holds real
-   personal data: Q28). Every start prints the target.
+   DML-only role. Dev holds no PII but does hold samples of actual data (Q28),
+   so it's used in place and never copied off. Every start prints the target.
 4. **Clean (real data) is query-only from laptops.** Access is by named people
    with IAM-only logins and a SELECT-only role, audited with pgaudit. App
    containers never target it, and no tooling dumps it. Nothing is ever copied
@@ -76,7 +76,7 @@ reproducibility 15, maintenance 10, licence 5 (total /500).
   IPs in the dev account (two RDS instances). The DB port is reachable from
   the VPN pool, so authentication and grants carry the access control. Someone owns
   the seed generator and keeps it in step with migrations.
-- Follow-ups: add RDS ENIs to the main IP budget (PROPOSAL.md §3.6). Get the VPN client pool CIDR from the network team at build time. Answer Q28. Move DEV-* from proposed to the contract on acceptance.
+- Follow-ups: add RDS ENIs to the main IP budget (PROPOSAL.md §3.6). Get the VPN client pool CIDR from the network team at build time. Move DEV-* from proposed to the contract on acceptance.
 
 ## Verification
 

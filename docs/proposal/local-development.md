@@ -20,8 +20,9 @@
 > local database only.** For RDS, the script fetches the URL and password from
 > Secrets Manager and passes them straight into the containers' environment,
 > with no file (§5.2.1). Dev is **not reset to synthetic data**:
-> its contents are the point (§5.2). Q28 asks whether that dirty data contains
-> real personal data, because the answer changes how laptops may connect.
+> its contents are the point (§5.2). **Dev holds no PII, but does hold samples
+> of actual data** (Q28). So the shared DML-only role is fine, and the
+> no-copy rule applies to dev too (§5.4).
 
 How a developer on a Windows laptop builds and runs the `api`, `agent` and
 `frontend` containers locally in VS Code. It runs against generated synthetic
@@ -441,11 +442,21 @@ deliberate, attributable and visible, not impossible:
   refresh hook when it reconnects after 15 minutes. If the app doesn't already
   support that, a static role password delivered the way the cluster delivers
   it (a Secret → env/file, PROPOSAL.md §2.2) keeps the app's code path
-  identical everywhere. That's acceptable for dev **only if the dirty data
-  holds no real personal data (Q28).** If it does, dev needs the same
-  per-person, audited access as clean: an IAM-authenticated login per
-  developer, with token refresh in the app or a per-person secret
-  that `up.sh` fetches instead. If the app gains IAM auth for prod (SEC-05), switch local over too.
+  identical everywhere. That's acceptable for dev because **dev holds no PII**
+  (Q28). If that changes, dev needs the same per-person, audited access as
+  clean: an IAM-authenticated login per developer, with token refresh in the
+  app or a per-person secret that `up.sh` fetches instead.
+- **Dev holds samples of actual data, so don't copy it either.** No PII doesn't
+  mean nothing sensitive: real samples can still be commercially or customer
+  confidential. The rule for dev is the same as for clean, *use it in place,
+  don't copy it*, with lighter enforcement:
+  - no `make` target or script dumps dev;
+  - the seed generator never reads from dev or clean;
+  - nothing from dev goes into Git, test fixtures, bug reports or screenshots
+    shared outside the team.
+
+  If you want this audited too, enable `pgaudit` on dev as on clean. That's
+  cheap, but optional at this sensitivity. If the app gains IAM auth for prod (SEC-05), switch local over too.
 - **No RDS credentials in Git, images or files on the laptop** [SEC-02].
   They're fetched at start and held only in process environments. `.env` (image
   digests) and `.env.local` (local DB only) are gitignored, and secret scanning runs in CI.
@@ -518,7 +529,7 @@ Multi-AZ). It doesn't change the verdict for any profile.
 |---|---|---|---|
 | R1 | ~~Laptops can reach the dev VPC~~ **Confirmed** (Q21). VPN is always on. Remaining: the VPN route also reaches *inside WSL2* | `networkingMode=mirrored`; failing that, the VPN vendor's WSL guidance | Q21 |
 | R2 | **Resolved: clean holds real data** (Q22). Design changed: query-only, named and audited access; generated local data; nothing copied from clean. | — | Q22, Q26 |
-| R9 | The dirty data on dev holds **no real personal or customer data** | Laptop access to dev moves from the shared `app_dev_local` role to per-person, audited logins (as clean), and the app containers must use them | Q28 |
+| R9 | **Confirmed: no PII on dev** (Q28), but it holds samples of actual data. If PII ever lands there,  laptop access to dev moves from the shared `app_dev_local` role to per-person, audited logins (as clean), and the app containers must use them | Q28 |
 | R3 | WSL2 + rootless Podman + Dev Containers works on our managed Windows build (endpoint security, Hyper-V policy). **Believed yes** (Q23). | Slice 1 will show it. Fallback: option A for toolchain, then option F if WSL itself is blocked. | Q23 |
 | R4 | **Resolved:** no corporate CA or proxy needed (Q24) | — | Q24 |
 | R5 | The app reads DB settings from env/file (hosting contract §2.2), so local and cluster delivery are identical | Small app change, needed for portability anyway | Q7 |
