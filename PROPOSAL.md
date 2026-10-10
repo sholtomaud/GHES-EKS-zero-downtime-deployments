@@ -1,4 +1,4 @@
-# Proposal: lean, zero-downtime delivery (v4)
+# Proposal: lean, zero-downtime delivery (v5)
 
 **Status:** Proposed, for review  ·  **Date:** 2026-10-10
 
@@ -10,15 +10,15 @@ The recommended design, written to be read on its own. The rest of the repo
 > v2 wrongly assumed we run deployments in customer environments.
 > v3 reflected the real split: CI/CD only in our AWS accounts; customers host
 > and deploy the app themselves.
-> **v4 incorporates your answers:**
-> - Customers **pull releases from a registry we expose**.
-> - The services **can run at mixed versions**, so rolling upgrades are the
->   default and blue/green is dropped.
-> - **Rollback must also have zero downtime.**
-> - **No secondary pod CIDR**, so our accounts move to **EKS on Fargate**.
->
-> v4 also corrects v3's surge arithmetic: a Helm upgrade rolls all 8 services
-> at once, so the peak is 16 pods, not 9.
+> v4 incorporated: customers pull from a registry we expose; services can run
+> mixed versions (rolling, no blue/green); rollback must be zero-downtime; no
+> secondary pod CIDR (EKS on Fargate). It also corrected v3's surge arithmetic:
+> a Helm upgrade rolls all 8 services at once, so the peak is 16 pods, not 9.
+> **v5 incorporates:** no EBS or privileged containers, so **Fargate is
+> confirmed**. **Artifactory is on-prem**, so releases are **copied into ECR**
+> for our AWS runtime (§3.2). The customer-facing registry is now an explicit
+> decision for you (§2.5). VPC NAT/endpoints are not a constraint. **On-prem
+> Kubernetes** is the customer platform that matters today (§2.4).
 
 ---
 
@@ -28,7 +28,7 @@ The recommended design, written to be read on its own. The rest of the repo
 |---|---|---|
 | Who deploys | Our CI/CD | The customer, with their tools (Helm, their Argo CD/Flux, scripts) |
 | Platform | EKS, AWS managed services allowed | Their EKS, GKE, ACK or on-prem. **No AWS services assumed.** |
-| How they get releases | Artifactory (internal) | **Pull from a customer-facing registry we expose** (§2.5) |
+| How they get releases | Copied by digest from on-prem Artifactory into **ECR** (§3.2) | **Pull from a customer-facing registry we expose** (§2.5) |
 | Zero downtime comes from | The chart's built-in behaviour **plus** our pipeline gates | **The chart's built-in behaviour alone** |
 
 The design:
@@ -46,29 +46,35 @@ The design:
 3. **Rolling updates everywhere, forward and back.** It's the same path
    customers run, so every prod release also proves the customer upgrade and
    rollback.
-4. **EKS with every pod on Fargate.** Each pod uses exactly one IP, with no
+4. **Releases are copied from on-prem Artifactory into ECR** at promotion time,
+   with the same digests and signatures. Our AWS runtime never depends on the
+   on-prem link: scaling, restarts and rollbacks keep working if it's down.
+5. **EKS with every pod on Fargate.** Each pod uses exactly one IP, with no
    node warm pools and no DaemonSets, and there are no nodes for us to patch.
    That's an estimated **~18 routable IPs at steady state and ~33 at the peak of
    a release**, with no secondary CIDR. Today it's ~130.
-5. **Argo CD, ARC, the in-cluster Prometheus stack, cert-manager and
+6. **Argo CD, ARC, the in-cluster Prometheus stack, cert-manager and
    external-dns are removed.** AWS managed services replace them **in our
    accounts only**. The app never requires them.
 
 ```mermaid
 flowchart LR
-  subgraph ours[Our side]
-    ghes[GHES Actions<br/>build · test · sign<br/>conformance on kind + non-AWS K8s] -->|images + chart by digest| art[(Artifactory<br/>internal repos)]
-    ghes -->|promote, approval for prod| cp[CodePipeline per account]
-    cp --> cb[CodeBuild in VPC<br/>helm upgrade · gate · rollback]
-    cb --> eks[Our EKS on Fargate<br/>dev · nonprod · prod]
-    art -. pull .-> eks
-    ghes -->|GA approval: copy release| pub[(Customer-facing<br/>release registry)]
+  subgraph onprem[On-prem]
+    ghes[GHES Actions<br/>build · test · sign<br/>conformance on kind + on-prem-style K8s] -->|images + chart by digest| art[(Artifactory)]
   end
-  pub ==>|pull with per-customer read token| cust
+  subgraph aws[Our AWS]
+    ecr[(ECR release cache<br/>same digests)]
+    cp[CodePipeline per account] --> cb[CodeBuild in VPC<br/>helm upgrade · gate · rollback]
+    cb --> eks[EKS on Fargate<br/>dev · nonprod · prod]
+    ecr -. pull .-> eks
+  end
+  ghes -->|promote: copy release by digest| ecr
+  ghes -->|start pipeline, approval for prod| cp
+  ghes -->|GA approval| pub[(Customer-facing<br/>release registry, §2.5)]
+  pub ==>|pull, per-customer read token| cust
   subgraph cust[Customer-hosted, their tooling]
-    c1[Their EKS]
-    c2[GKE / Alibaba ACK]
-    c3[On-prem K8s]
+    c3[On-prem K8s, today]
+    c1[Their EKS / GKE / ACK, later]
   end
 ```
 
@@ -148,23 +154,40 @@ throughout:
 4. **Rollback N → N-1: 0 failed requests**, including against N's schema.
 5. A deliberately broken release auto-rolls back with 0 failed requests.
 
-A scheduled job repeats this on one non-AWS distribution (e.g. GKE or k3s)
-[PORT-01/02]. Each release ships a compatibility matrix [PORT-05].
+Because **on-prem Kubernetes is the customer platform that matters today**,
+a scheduled job repeats the suite on the on-prem distribution(s) customers
+actually run (RKE2/k3s, OpenShift, Tanzu, kubeadm: Q20). It also covers the
+on-prem realities:
+- **No Gateway API or cloud LB assumed.** The Ingress and plain-Service
+  exposure modes are tested.
+- **OpenShift-style restricted security.** Pods run as an arbitrary non-root
+  UID with a read-only root FS and no capabilities, so the chart works under
+  the strictest common policy.
+- **Private registry mirror.** Installs run from a mirror, with
+  `global.registry` overridden [PORT-06].
 
-### 2.5 Customer-facing release registry
+[PORT-01/02] Each release ships a compatibility matrix [PORT-05].
 
-Customers pull releases from a registry we expose. To keep internal builds
-private:
+### 2.5 Customer-facing release registry (decision needed)
 
-| Concern | Design |
-|---|---|
-| Repository | A **dedicated Artifactory repository** (Docker/OCI) for customer releases, e.g. `releases.<our-domain>`, separate from internal build repos |
-| What goes in | Only releases approved as **GA**: a GHES approval copies the signed chart and images, by digest, into it. Dev/nonprod builds are never visible. |
-| Access | **Per-customer read-only tokens**, scoped to that repository, revocable, with expiry and rotation |
-| Integrity | Customers can verify **cosign signatures** and provenance before installing |
-| Resilience | Recommend customers **mirror or proxy** into their own registry (Harbor, ECR, Artifact Registry, ACR pull-through), so their runtime doesn't depend on our availability |
-| Exposure | Public HTTPS endpoint with WAF/rate limits, or Artifactory's own edge/distribution features. Q5 decides which. |
-| Audit | Artifactory access logs show which customer pulled which version |
+Customers pull releases from a registry we expose. Only releases approved as
+**GA** in GHES are copied there, by digest and with their cosign signatures.
+Each customer gets a **read-only, revocable token**. Internal dev and nonprod
+builds are never visible. Since Artifactory is on-prem, where that registry
+lives is a real choice:
+
+| Option | Customer experience | Security / ops | Cost |
+|---|---|---|---|
+| **A. Expose a dedicated release repo on on-prem Artifactory** (via DMZ reverse proxy / WAF) | Best: standard registry login with long-lived scoped tokens. Works with any mirror tool. | Puts on-prem infrastructure on the internet. Needs security sign-off, WAF, rate limits. On-prem availability becomes customer-facing. | Low (existing licence) |
+| **B. ECR in a dedicated "distribution" AWS account** | OK: ECR login tokens last 12 h, so customers need a credential helper or a mirror that refreshes (Harbor, Artifactory, Nexus and others support ECR as an upstream) | Nothing on-prem exposed. Managed, highly available, IAM-scoped per customer, CloudTrail audit. | Very low |
+| **C. A hosted registry with token auth** (e.g. a JFrog SaaS/edge instance, or Harbor in AWS) | Best | Nothing on-prem exposed, but one more system to run or license | Medium |
+
+**Recommendation: B**, unless your security team is comfortable exposing
+on-prem Artifactory. B reuses the ECR copy step our own accounts need (§3.2),
+exposes nothing on-prem, and costs almost nothing. Customer friction is limited
+because we already recommend they **mirror into their own registry**, and on-prem
+customers usually must anyway. If customer feedback says ECR auth is too
+awkward, move to C without changing the release or the chart.
 
 ---
 
@@ -182,7 +205,30 @@ GHES Actions runs on runners in a **tooling account** or on ephemeral compute,
 5. Run the conformance suite (§2.4).
 6. Promote to dev automatically.
 
-### 3.2 Promotion and deployment
+### 3.2 Getting releases from on-prem Artifactory into AWS
+
+**Why:** Fargate keeps no image cache, so **every pod start pulls its full image**.
+If Fargate pulled from on-prem Artifactory, every scale-up, restart and
+**rollback** would depend on the on-prem link and Artifactory's availability.
+That's a hidden single point of failure for zero downtime.
+
+**Design:**
+- The GHES promote workflow, which runs on-prem next to Artifactory, **copies
+  the release by digest** into a central **ECR** (`crane`/`oras` copy). This
+  covers the 8 images, the OCI chart, and the signatures/SBOM/provenance.
+  Digests are unchanged, so "deploy by digest" still identifies exactly what
+  Artifactory built [REL-01/02].
+- ECR lives in one **release account**. Workload accounts pull cross-account
+  through a repository policy granting their Fargate pod-execution roles.
+- The previous releases stay in ECR, so **rollback never needs on-prem**.
+  A lifecycle policy keeps, say, the last 10 releases.
+- Network: only **outbound** from on-prem to the AWS ECR API. CodeBuild and EKS
+  never need a route back to on-prem.
+- **Artifactory stays the source of truth.** ECR is a runtime cache, as already
+  allowed by ADR-0001 ("ECR … of Artifactory MAY be considered as an adapter if
+  justified"). This will be recorded in a new ADR.
+
+### 3.3 Promotion and deployment
 
 ```mermaid
 sequenceDiagram
@@ -195,6 +241,7 @@ sequenceDiagram
   participant W as CloudWatch (ALB metrics)
   G->>R: promote app 1.14.0 → prod
   R-->>G: approved (who/when recorded)
+  G->>G: copy release by digest Artifactory → ECR (if not already there)
   G->>P: StartPipelineExecution(version, chart digest)
   P->>B: deploy stage (QUEUED mode: one at a time)
   B->>B: verify signatures + provenance
@@ -214,7 +261,7 @@ sequenceDiagram
 | Trigger | A **promotion** in GHES, not an image push | DEP-03 |
 | Approval | **GHES Environments** with required reviewers (nonprod, prod, GA/customer release). This is the single approval record. | DEP-02 |
 | Identity | GHES → AWS via OIDC, to a role that can *only* start the pipeline. Only the CodeBuild role can write to the cluster. Dev and prod roles are separate. | DEP-04 |
-| Network | GHES makes outbound AWS API calls only. Nothing connects into the cluster from outside. CodeBuild runs in the VPC and reaches the private EKS endpoint and Artifactory. | DEP-05 |
+| Network | GHES makes outbound AWS API calls only. Nothing connects into the cluster from outside. CodeBuild runs in the VPC, reaches the private EKS endpoint, and pulls the chart from ECR. **No AWS → on-prem path is needed.** | DEP-05 |
 | One deploy at a time | CodePipeline V2 `QUEUED` execution mode | DEP-06 |
 | Same interface as customers | CodeBuild runs `helm upgrade` with the chart + profile + `adapters/aws.yaml` + env values: the documented customer interface, wrapped with gates | DEP-01 |
 | What's running where | CodePipeline history, CloudTrail, and SSM parameter `/app/<env>/current-release` | DEP-09 |
@@ -224,7 +271,7 @@ The gate, rollback and record logic lives in a small script in our **ops
 repo**. It's internal automation around the customer interface, not part of the
 product.
 
-### 3.3 Release gate and rollback
+### 3.4 Release gate and rollback
 
 - **Gate:** pods become ready (with ALB target health via readiness gates),
   `helm test` passes, and the ALB target group's 5xx rate and p95 latency stay
@@ -235,15 +282,16 @@ product.
 - Either way it's a rolling update: **zero downtime**, taking about 2–3 minutes
   to complete [ZDT-02].
 
-### 3.4 Cluster, compute and managed services (our accounts only)
+### 3.5 Cluster, compute and managed services (our accounts only)
 
 | Choice | Decision |
 |---|---|
-| Compute | **EKS with all pods on Fargate.** One ENI and one IP per pod, no warm pool, no DaemonSets, no nodes to patch or scale. |
+| Compute | **EKS with all pods on Fargate** (confirmed: the app needs no EBS or privileged containers). One ENI and one IP per pod, no warm pool, no DaemonSets, no nodes to patch or scale. |
 | System pods | **CoreDNS** (EKS managed add-on, on Fargate) and the **AWS Load Balancer Controller** (2 pods, `ip` target mode). Those are the only platform pods. |
 | Clusters | One per account/environment |
 | Ingress / TLS / DNS | One shared ALB per environment (IngressGroup), ACM certificate, Route 53 records in IaC |
 | Telemetry | ALB CloudWatch metrics (release gate). **Fargate's built-in Fluent Bit log router** → CloudWatch Logs, with no sidecars or DaemonSets. Optional Amazon Managed Prometheus scraper *(verify Fargate support)*. |
+| Images | Pulled from the ECR release cache (§3.2), never directly from on-prem |
 | Secrets / DB | Secrets Manager synced to K8s Secrets at deploy time; RDS |
 | IaC | Terraform/OpenTofu (Q12): VPC wiring, cluster, Fargate profiles, access entries, pipeline, CodeBuild, OIDC trust, ALB/DNS, alarms |
 
@@ -255,12 +303,12 @@ product.
 | Managed node groups + VPC CNI with `WARM_IP_TARGET=1` | ~35–40 | Medium: node AMIs, add-ons, scaling | Warm IPs per node plus DaemonSet pods add up |
 | EKS Auto Mode in primary subnets | uncertain | Low | IP allocation behaviour in small subnets *(verify)*. Can't be budgeted precisely yet. |
 
-Fargate's constraints are worth checking against the app (Q7): no EBS volumes
-(EFS works), no DaemonSets, no privileged containers, and limited CPU/memory
-combinations. For cost at this size (≈ 10–12 small pods), Fargate is generally
+You've confirmed the app needs no EBS volumes or privileged containers, so
+Fargate fits. Remaining Fargate limits to respect: no DaemonSets, and fixed
+CPU/memory size combinations. For cost at this size (≈ 10–12 small pods), Fargate is generally
 comparable to 2–3 EC2 nodes *(estimate in Phase 1 with real pod sizes)*.
 
-### 3.5 IP budget (no secondary CIDR, 2 AZs)
+### 3.6 IP budget (no secondary CIDR, 2 AZs)
 
 A Helm upgrade rolls all 8 Deployments at once, each surging by one pod, so the
 app pod count doubles briefly at peak.
@@ -272,16 +320,13 @@ app pod count doubles briefly at peak.
 | CoreDNS (2) + LB controller (2) | 4 | 4 | 4 | 4 |
 | ALB (min 1/AZ, can scale to ~8) | 2 | 8 | 2 | 8 |
 | CodeBuild ENI (during deploys only) | 0 | 1 | 0 | 1 |
-| VPC endpoints (0 if centralised or using NAT) | 0 | 0 | 0 | 0 |
+| VPC endpoints (not a constraint, per you) | 0 | 0 | 0 | 0 |
 | **Total routable** | **18** | **33** | **26** | **41** |
 
 - Both profiles fit **NET-01 (≤ 50)**. In an **80-IP account** the minimal peak
   leaves ~59% free and the HA peak ~49% free [NET-02]. Today it's ~130.
-- If interface VPC endpoints must be local (no NAT, no central hub), add ~10.
-  The HA peak becomes ~51, slightly over budget. The fix is to cap surge by
-  rolling services in two batches (pipeline option), which brings the HA peak to ~47.
 - During the one-off **migration** from the old platform, both stacks can't sit
-  in the same constrained account at once. The plan (§6, slice 5) uses a fresh
+  in the same constrained account at once. The plan (§7, slice 5) uses a fresh
   account or VPC and a DNS cutover.
 
 ---
@@ -332,12 +377,11 @@ The winner doesn't change.
 | # | Assumption | If wrong | Q |
 |---|---|---|---|
 | R1 | Services tolerate N/N+1 running together (you expect so) | The CI mixed-version test (§2.4) will catch it. Fix the API compatibility, or fall back to blue/green. | Q1 |
-| R2 | App fits Fargate: no EBS, privileged or DaemonSet needs | Managed node groups with tuned VPC CNI (~35–40 IPs peak) | Q7 |
-| R3 | CodeBuild in the VPC can reach Artifactory, and Fargate pods can pull from it | Use a pull-through cache in ECR *(ADR needed)* | Q5 |
-| R4 | AWS IAM can trust GHES OIDC tokens (the issuer must be reachable by AWS) | Runner instance roles in the tooling account assume the trigger role | Q4 |
-| R5 | DB changes can follow expand/contract, with no destructive change in the same release | **Required for zero-downtime rollback**, under any design. It's app work and must be planned. | Q7 |
-| R6 | We can expose a customer-facing Artifactory repository securely | Use a separate registry (e.g. a public-facing ECR or Harbor) fed by the same GA promotion | Q5 |
-| R7 | NAT or central VPC endpoints exist in our accounts | Add ~10 IPs for local endpoints. HA then needs batched rollout (§3.5). | Q14 |
+| R2 | On-prem GHES runners can push outbound to the AWS ECR API | Run the copy step from a runner in the AWS tooling account that can read Artifactory | Q4 |
+| R3 | AWS IAM can trust GHES OIDC tokens (the on-prem issuer must be reachable by AWS, or its discovery docs published) | Runner instance roles / short-lived credentials from a tooling account assume the trigger role | Q4 |
+| R4 | DB changes can follow expand/contract, with no destructive change in the same release | **Required for zero-downtime rollback**, under any design. It's app work and must be planned. | Q7 |
+| R5 | ECR auth friction is acceptable to customers (if option B is chosen) | Switch to option C (§2.5). Release and chart are unchanged. | Q19 |
+| R6 | Customer on-prem clusters can reach our customer-facing registry, or mirror from it | Offer a signed offline bundle for air-gapped sites [PORT-06] | Q20 |
 
 ---
 
@@ -346,11 +390,11 @@ The winner doesn't change.
 | # | Slice | Proves | Size (1–2 engineers) |
 |---|---|---|---|
 | 1 | Chart with zero-downtime rules, digests, schema, adapters, signing. Conformance on kind: upgrade, **mixed-version** and **rollback** under load, broken-release auto-rollback. | ZDT-*, REL-*, PORT-01/07/08 | 2–3 wks |
-| 2 | Dev account: EKS + Fargate profiles, LB controller, CodePipeline/CodeBuild, GHES promote workflow. **Measure IPs.** | DEP-*, NET-01 | 2 wks |
+| 2 | Release account ECR + Artifactory → ECR copy step. Dev account: EKS + Fargate profiles, LB controller, CodePipeline/CodeBuild, GHES promote workflow. **Measure IPs.** | DEP-*, NET-01, §3.2 | 2–3 wks |
 | 3 | Nonprod with approvals, ALB-metric gate, auto-rollback, SSM record, drift job | DEP-02/09, ZDT-02/03, OPS-03 | 1 wk |
 | 4 | Deploy into an ~80-IP account (or a deliberately constrained VPC) | NET-02 | 2–3 days |
 | 5 | Prod migration: new stack in a fresh VPC/account, Route 53 weighted cutover, decommission the old stack | MIG-* | 1–2 wks |
-| 6 | Customer-facing release registry, per-customer tokens, GA promotion, customer docs, scheduled non-AWS conformance | PORT-02/05, §2.5 | 1–2 wks |
+| 6 | Customer-facing release registry (option per §2.5), per-customer tokens, GA promotion, customer docs, scheduled **on-prem-distro** conformance | PORT-02/05/06, §2.5 | 1–2 wks |
 
 About **8–10 weeks** to prod cutover. The app work for graceful shutdown,
 N/N+1 compatibility and expand/contract migrations is the main variable, and
@@ -360,11 +404,14 @@ it's needed for zero downtime under any design.
 
 ## 8. Remaining questions that matter
 
-1. **Does the app need EBS volumes, privileged containers or DaemonSets?** (Q7)
-   If yes, Fargate is out and we use tuned node groups instead.
-2. **Where is Artifactory hosted, and can it safely expose a customer-facing
-   repository?** (Q5)
-3. **Do our VPCs have NAT or central VPC endpoints?** (Q14) This affects the HA
-   IP budget.
-4. **Which customer platforms are real today?** (Q9) This sets the non-AWS
-   conformance target.
+1. **Customer-facing registry:** may we expose a release repo on on-prem
+   Artifactory (option A)? Or do we go with ECR in a distribution account
+   (option B, recommended)? (§2.5, Q19)
+2. **Which on-prem Kubernetes distributions** do customers run (RKE2/k3s,
+   OpenShift, Tanzu, kubeadm…), and are any **air-gapped**? This sets the
+   conformance target and whether we need an offline bundle. (Q20)
+3. **Can on-prem GHES runners reach the AWS APIs outbound** (ECR push, OIDC
+   role assumption)? (Q4)
+4. **What stateful services does the app use** (Postgres, Redis, queues,
+   object storage)? This sets the customer adapters and the expand/contract
+   migration work. (Q7)
