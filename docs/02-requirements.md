@@ -77,8 +77,8 @@ written reason to omit. **MAY** = nice to have; don't build it unless it's free.
 | PORT-04 | Traffic exposure supports Gateway API, with a plain `Service`/Ingress fallback documented. | SHOULD | Conformance on ≥ 2 Gateway implementations. |
 | PORT-05 | Customer install and upgrade docs, prerequisites (K8s versions, CPU/mem/storage, network) and a compatibility matrix ship with every release. | MUST | Docs generated/checked in the release workflow. |
 | PORT-06 | Air-gapped/private-registry install is possible (images and chart can be mirrored; registry is configurable). | SHOULD | Install from a mirrored registry. |
-| PORT-07 | The **delivery, zero-downtime and rollback mechanisms** used in environments *we* operate work identically on every supported platform (EKS, GKE, ACK, on-prem) without relying on any one cloud's managed services. Cloud services may only be used as optional adapters. | MUST | Same conformance suite and promotion flow pass on EKS and a non-AWS cluster. |
-| PORT-08 | The only network dependency a target environment must provide for delivery is pull access to a container registry (Artifactory or a mirror). No inbound access from our systems is required. | MUST | Network review; deploy into an environment with egress to the registry only. |
+| PORT-07 | The application has **no hard dependency on any cloud's managed services**. Every such integration (load balancer, certificates, secrets store, telemetry backend, database) is an optional adapter selected by values. | MUST | Install and upgrade with all AWS adapters disabled. |
+| PORT-08 | A customer's plain `helm upgrade` (or their own GitOps tool) performs a **zero-downtime rolling upgrade** on any conformant Kubernetes, with no tooling from us. The zero-downtime behaviour lives in the chart and app, not in our pipeline. | MUST | Conformance: load test during `helm upgrade` on kind and a non-AWS distro; 0 failed requests. |
 
 ## SEC: Security and compliance
 

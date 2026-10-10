@@ -29,8 +29,8 @@ deployed there at all.
 | dev | us | us | High change rate |
 | nonprod / test / staging | us | us | Pre-prod validation |
 | prod | us | us | Internal customers' production |
-| customer-managed (AWS) | customer | customer (or us, on request?) | Their account, their rules |
-| customer-managed (GKE / Alibaba / on-prem K8s) | customer | customer | No AWS services available |
+| customer-hosted (AWS) | customer | **customer**, with their own tooling | Their account, their rules. No CI/CD from us. |
+| customer-hosted (GKE / Alibaba / on-prem K8s) | customer | **customer**, with their own tooling | No AWS services available. No CI/CD from us. |
 
 Each of these currently drifts into its own variant. **Goal: one product,
 one release artefact, a small set of documented install profiles, and

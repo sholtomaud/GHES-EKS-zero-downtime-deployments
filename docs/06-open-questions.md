@@ -14,7 +14,8 @@ answer changes, so prioritise accordingly.
 | Q5 | Where is **Artifactory** hosted (SaaS, on-prem, in AWS)? Can AWS accounts and customer clusters reach it privately? Does it proxy public registries? | Image pull path, CodePipeline egress, air-gap story. | _unanswered_ |
 | Q6 | What exactly runs today? Confirm **ARC = Actions Runner Controller** and that runners run in workload clusters. Full list of add-ons per cluster. | Phase 0 baseline and the size of the win. | _unanswered_ |
 | Q7 | What **stateful dependencies** exist (RDS/Postgres, Redis, queues, object storage)? Managed in our accounts, and what do customers provide? | Migration (ZDT-05), portability adapters, storage on Fargate. | _unanswered_ |
-| Q8 | Do we **operate** deployments in customer environments (any cloud/on-prem), or do customers always self-install? | Decides where our delivery mechanism (Flux) must run; see PROPOSAL.md R1. | _unanswered_ |
+| Q8 | Do we **operate** deployments in customer environments, or do customers always self-install? | Decides where our delivery mechanism must run. | **Answered:** CI/CD runs only in our own AWS accounts. Customers host and deploy the app themselves. |
+| Q18 | How do customers **obtain** releases: pull from a customer-facing registry (e.g. Artifactory with per-customer read tokens), or a signed offline bundle? | Release distribution and air-gap story (PORT-06). | _unanswered_ |
 
 ## Medium impact
 
