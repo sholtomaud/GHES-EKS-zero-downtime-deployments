@@ -44,7 +44,9 @@ grep -q '^version: 1.0.1760000000$' <<<"$meta" || fail "bundle version"
 grep -q '^appVersion: 1.14.0$' <<<"$meta" || fail "appVersion"
 ok "bundle name, version and appVersion are filled in"
 
-tar -tzf "$tgz" | grep -q '^app-prod/charts/app-1.14.0.tgz$' || fail "customer chart not vendored"
+# Capture first: `tar | grep -q` would fail under pipefail when grep exits early (SIGPIPE).
+listing="$(tar -tzf "$tgz")"
+grep -qx 'app-prod/charts/app-1.14.0.tgz' <<<"$listing" || { echo "$listing" >&2; fail "customer chart not vendored"; }
 ok "the customer chart is vendored unchanged (Argo CD needs only ECR) [DEP-01]"
 
 rendered="$(helm template x "$tgz")"
