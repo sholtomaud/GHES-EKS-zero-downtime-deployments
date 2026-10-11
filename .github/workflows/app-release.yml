@@ -1,0 +1,170 @@
+# Reusable release workflow for the application repo: build once, record
+# everything in Artifactory with build-info, gate on SonarQube and JFrog Xray.
+# Nothing here deploys anything [DEP-03]: deployment is a promotion
+# (app-promote.yml).
+#
+#   SonarQube scan + quality gate  ->  docker build x8  ->  jf docker push (build-info)
+#   ->  chart with digests.json  ->  helm push (Artifactory OCI)  ->  jf rt build-publish
+#   ->  jf build-scan (Xray: fails the run on a policy violation)
+#
+# Caller (in the app repo):
+#   jobs:
+#     release:
+#       uses: <org>/<this-repo>/.github/workflows/app-release.yml@<sha>
+#       with: { version: "1.14.0" }
+#       secrets: inherit
+#
+# Repository/organisation configuration the caller needs:
+#   vars:    JF_URL, JF_OIDC_PROVIDER, ARTIFACTORY_DOCKER_REPO, ARTIFACTORY_HELM_REPO,
+#            ARTIFACTORY_RELEASE_META_REPO, SONAR_HOST_URL
+#   secrets: SONAR_TOKEN
+# JFrog access is OIDC (no stored token): configure an OpenID Connect
+# integration in the JFrog Platform that trusts this GHES instance's issuer.
+name: app-release
+
+on:
+  workflow_call:
+    inputs:
+      version:
+        description: Release version (semver). Becomes the chart version and every image tag.
+        type: string
+        required: true
+      services:
+        description: JSON array of service directories under services/ (one image each).
+        type: string
+        default: '["api","agent","frontend","service-4","service-5","service-6","service-7","service-8"]'
+      chart-path:
+        type: string
+        default: chart
+      runner:
+        type: string
+        default: ubuntu-24.04
+    outputs:
+      chart-digest:
+        description: Digest of the OCI chart in Artifactory.
+        value: ${{ jobs.release.outputs.chart-digest }}
+
+permissions:
+  contents: read
+  id-token: write # OIDC to JFrog
+
+concurrency:
+  group: app-release-${{ inputs.version }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 60
+    outputs:
+      chart-digest: ${{ steps.chart.outputs.digest }}
+    env:
+      VERSION: ${{ inputs.version }}
+      SERVICES: ${{ inputs.services }}
+      BUILD_NAME: ${{ github.event.repository.name }}
+      BUILD_NUMBER: ${{ inputs.version }}
+      JF_URL: ${{ vars.JF_URL }}
+    steps:
+      - name: Refuse non-semver and mutable versions [REL-02]
+        run: |
+          [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]] || { echo "version must be semver, got '$VERSION'" >&2; exit 1; }
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      # --- SonarQube Server (vendor action), before anything is published ----
+      - name: SonarQube scan and quality gate
+        uses: SonarSource/sonarqube-scan-action@d209202bc7d53ff1cc128f7f907dac145c9d6ae9 # v8.3.0
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          SONAR_HOST_URL: ${{ vars.SONAR_HOST_URL }}
+        with:
+          args: >
+            -Dsonar.projectVersion=${{ inputs.version }}
+            -Dsonar.qualitygate.wait=true
+            -Dsonar.qualitygate.timeout=300
+
+      # --- JFrog CLI (vendor action), OIDC, no stored credentials -------------
+      - name: Set up JFrog CLI
+        id: jf
+        uses: jfrog/setup-jfrog-cli@68c0efdc951dd2359bbbfa15c48bc67b3ae8e4d6 # v5.2.0
+        with:
+          version: 2.124.0
+          oidc-provider-name: ${{ vars.JF_OIDC_PROVIDER }}
+          ghe-base-url: ${{ github.api_url }}
+          disable-auto-build-publish: true # we publish explicitly, after the chart
+
+      - name: Registry login (Docker and Helm OCI) with the OIDC token
+        env:
+          JF_USER: ${{ steps.jf.outputs.oidc-user }}
+          JF_TOKEN: ${{ steps.jf.outputs.oidc-token }}
+        run: |
+          host="${JF_URL#https://}"; host="${host%%/*}"
+          echo "JF_HOST=$host" >> "$GITHUB_ENV"
+          echo "$JF_TOKEN" | docker login "$host" -u "$JF_USER" --password-stdin
+          echo "$JF_TOKEN" | helm registry login "$host" -u "$JF_USER" --password-stdin
+
+      # --- Images: built once, pushed with build-info, recorded by digest ----
+      - name: Build and push images
+        env:
+          DOCKER_REPO: ${{ vars.ARTIFACTORY_DOCKER_REPO }}
+        run: |
+          set -euo pipefail
+          echo '{}' > digests.json
+          for svc in $(jq -r '.[]' <<<"$SERVICES"); do
+            ref="$JF_HOST/$DOCKER_REPO/$svc:$VERSION"
+            docker build --pull --label "org.opencontainers.image.version=$VERSION" \
+              --label "org.opencontainers.image.revision=$GITHUB_SHA" -t "$ref" "services/$svc"
+            jf docker push "$ref" --build-name="$BUILD_NAME" --build-number="$BUILD_NUMBER"
+            digest="$(docker inspect --format '{{index .RepoDigests 0}}' "$ref" | cut -d@ -f2)"
+            [[ "$digest" == sha256:* ]] || { echo "no digest for $svc" >&2; exit 1; }
+            jq --arg s "$svc" --arg d "$digest" '.[$s] = $d' digests.json > d.tmp && mv d.tmp digests.json
+          done
+          jq . digests.json
+
+      # --- Chart: the release unit, pinning all digests [REL-03] -------------
+      - uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
+        with:
+          version: v4.3.0
+
+      - name: Package and push the chart (OCI)
+        id: chart
+        env:
+          CHART_PATH: ${{ inputs.chart-path }}
+          HELM_REPO: ${{ vars.ARTIFACTORY_HELM_REPO }}
+        run: |
+          set -euo pipefail
+          # Templates read image digests from the chart's own digests.json:
+          # customers override the registry, never the digest.
+          cp digests.json "$CHART_PATH/digests.json"
+          helm lint "$CHART_PATH" --strict
+          helm package "$CHART_PATH" --version "$VERSION" --app-version "$VERSION" -d dist
+          tgz="$(ls dist/*-"$VERSION".tgz)"
+          helm push "$tgz" "oci://$JF_HOST/$HELM_REPO" 2>&1 | tee push.log
+          digest="$(grep -Eo 'sha256:[0-9a-f]{64}' push.log | tail -1)"
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+          echo "TGZ=$tgz" >> "$GITHUB_ENV"
+
+      # --- Build-info: chart and digests in the same build as the images -----
+      - name: Record chart and digests in build-info
+        env:
+          META_REPO: ${{ vars.ARTIFACTORY_RELEASE_META_REPO }}
+        run: |
+          jf rt upload "$TGZ" "$META_REPO/$BUILD_NAME/$VERSION/" --build-name="$BUILD_NAME" --build-number="$BUILD_NUMBER" --flat
+          jf rt upload digests.json "$META_REPO/$BUILD_NAME/$VERSION/" --build-name="$BUILD_NAME" --build-number="$BUILD_NUMBER" --flat
+          jf rt build-collect-env "$BUILD_NAME" "$BUILD_NUMBER"
+          jf rt build-add-git "$BUILD_NAME" "$BUILD_NUMBER"
+          jf rt build-publish "$BUILD_NAME" "$BUILD_NUMBER"
+
+      # --- JFrog Xray: scan the published build against its watches ----------
+      - name: Xray build scan
+        run: jf build-scan "$BUILD_NAME" "$BUILD_NUMBER" --fail=true
+
+      - name: Summary
+        run: |
+          {
+            echo "### Release $VERSION"
+            echo "Chart: \`oci://$JF_HOST/${{ vars.ARTIFACTORY_HELM_REPO }}\` @ \`${{ steps.chart.outputs.digest }}\`"
+            echo '```json'; cat digests.json; echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"

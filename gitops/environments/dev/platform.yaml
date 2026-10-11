@@ -1,0 +1,45 @@
+# Platform pieces in dev, all on Fargate: the AWS Load Balancer Controller (the
+# only platform Deployment besides CoreDNS) and the Fargate log router config.
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: aws-load-balancer-controller-dev
+  namespace: argocd
+spec:
+  project: default
+  source:
+    repoURL: https://aws.github.io/eks-charts
+    chart: aws-load-balancer-controller
+    targetRevision: 1.17.1 # controller v2.17.1, matching infra/src/policies
+    helm:
+      valuesObject:
+        clusterName: app-dev
+        region: ap-southeast-2 # Fargate has no IMDS: region and VPC must be explicit
+        vpcId: vpc-0dev0000000000
+        replicaCount: 2
+        serviceAccount:
+          name: aws-load-balancer-controller
+          annotations:
+            eks.amazonaws.com/role-arn: arn:aws:iam::222222222222:role/app-dev-aws-load-balancer-controller
+  destination:
+    name: app-dev
+    namespace: kube-system
+  syncPolicy:
+    automated: { prune: true, selfHeal: true }
+---
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: aws-observability-dev
+  namespace: argocd
+spec:
+  project: default
+  source:
+    repoURL: https://codeconnections.ap-southeast-2.amazonaws.com/git-http/111111111111/ap-southeast-2/00000000-0000-0000-0000-000000000000/platform/app-deploy.git
+    targetRevision: main
+    path: environments/dev/observability
+  destination:
+    name: app-dev
+    namespace: aws-observability
+  syncPolicy:
+    automated: { prune: true, selfHeal: true }

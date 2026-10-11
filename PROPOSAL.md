@@ -2,6 +2,13 @@
 
 **Status:** Proposed, for review  ·  **Date:** 2026-10-10
 
+> **Update 2026-10-11:** [docs/proposal/design.md](docs/proposal/design.md)
+> replaces the delivery mechanism in §3.3 (CodePipeline + CodeBuild) with the
+> **EKS managed Argo CD capability** on a zero-pod hub (ADR-0004, proposed). It
+> also records the IaC (cdktn → OpenTofu, ADR-0005), logging (ADR-0006) and the
+> customer registry (ECR, ADR-0007). The chart, zero-downtime rules,
+> Fargate, the ECR cache and the IP budget below still stand.
+
 The recommended design, written to be read on its own. The rest of the repo
 (requirements, IP model, options, open questions) is supporting detail.
 
