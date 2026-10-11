@@ -44,9 +44,9 @@ grep -q '^version: 1.0.1760000000$' <<<"$meta" || fail "bundle version"
 grep -q '^appVersion: 1.14.0$' <<<"$meta" || fail "appVersion"
 ok "bundle name, version and appVersion are filled in"
 
-# Capture first: `tar | grep -q` would fail under pipefail when grep exits early (SIGPIPE).
-listing="$(tar -tzf "$tgz")"
-grep -qx 'app-prod/charts/app-1.14.0.tgz' <<<"$listing" || { echo "$listing" >&2; fail "customer chart not vendored"; }
+# Helm packages vendored subcharts unpacked, under charts/<name>/.
+sub="$(tar -xzOf "$tgz" app-prod/charts/app/Chart.yaml 2>/dev/null)" || fail "customer chart not vendored"
+grep -qx 'version: 1.14.0' <<<"$sub" || { echo "$sub" >&2; fail "vendored customer chart is not 1.14.0"; }
 ok "the customer chart is vendored unchanged (Argo CD needs only ECR) [DEP-01]"
 
 rendered="$(helm template x "$tgz")"
