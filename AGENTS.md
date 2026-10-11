@@ -46,6 +46,15 @@ Do not change that status yourself.
    the design. Make your assumption explicit and show how the design changes if
    it's wrong.
 
+## Tools
+
+- For any CDKTF, Terraform CDK or CDK Terrain question, use the
+  `cdktn-terraform-cdk-docs` MCP server (`.mcp.json`). CDKTN is the maintained
+  successor to the deprecated HashiCorp CDKTF; don't answer from CDKTF memory.
+- Infra changes are test-first: add or change a test in `infra/test/`, see it
+  fail, then change `infra/src/`. `make ci` (or `make CONTAINER=none ci`) must
+  pass before you push.
+
 ## Output conventions
 
 - Markdown, one topic per file, Mermaid for diagrams.

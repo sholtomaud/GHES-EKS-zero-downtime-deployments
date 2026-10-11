@@ -8,3 +8,4 @@ The current proposal is [../../PROPOSAL.md](../../PROPOSAL.md). Detailed files l
 | Proposal | ADR | Status |
 |---|---|---|
 | [Local development workflow](local-development.md): WSL2 + Podman + VS Code, `make dev`, dev/clean RDS | [ADR-0003](../adr/0003-local-development-workflow.md) | Proposed |
+| [Design: managed Argo CD + cdktn IaC](design.md): deployment options scored, managed Argo CD hub, Fargate logging, IaC, CI workflows | [0004](../adr/0004-delivery-via-eks-managed-argocd.md)–[0007](../adr/0007-customer-distribution-via-ecr.md) | Proposed |

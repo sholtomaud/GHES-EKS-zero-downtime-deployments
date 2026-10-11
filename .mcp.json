@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "cdktn-terraform-cdk-docs": {
+      "type": "http",
+      "url": "https://cdktn.io/docs/mcp"
+    }
+  }
+}

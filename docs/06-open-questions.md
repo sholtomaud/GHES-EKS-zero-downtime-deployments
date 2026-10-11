@@ -16,7 +16,7 @@ answer changes, so prioritise accordingly.
 | Q7 | What **stateful dependencies** exist (RDS/Postgres, Redis, queues, object storage)? Managed in our accounts, and what do customers provide? | Migration (ZDT-05), portability adapters, storage on Fargate. | **Answered:** Partial: no EBS volumes or privileged containers, so Fargate fits. Stateful services (DB, cache, queues) still to list. |
 | Q8 | Do we **operate** deployments in customer environments, or do customers always self-install? | Decides where our delivery mechanism must run. | **Answered:** CI/CD runs only in our own AWS accounts. Customers host and deploy the app themselves. |
 | Q18 | How do customers **obtain** releases: pull from a customer-facing registry (e.g. Artifactory with per-customer read tokens), or a signed offline bundle? | Release distribution and air-gap story (PORT-06). | **Answered:** Customers pull from a customer-facing registry we expose (PROPOSAL §2.5). |
-| Q19 | Where should the **customer-facing release registry** live: exposed Artifactory (A), ECR in a distribution account (B, recommended), or a hosted registry (C)? | Customer pull experience vs on-prem exposure (PROPOSAL §2.5). | _unanswered_ |
+| Q19 | Where should the **customer-facing release registry** live: exposed Artifactory (A), ECR in a distribution account (B, recommended), or a hosted registry (C)? | Customer pull experience vs on-prem exposure (PROPOSAL §2.5). | **Answered (2026-10-11):** ECR. Customers deploy from Artifactory → ECR and don't run GitOps (ADR-0007). |
 | Q20 | Which **on-prem Kubernetes distributions** do customers run (RKE2/k3s, OpenShift, Tanzu, kubeadm…), and are any air-gapped? | Conformance target; offline bundle need. | _unanswered_ |
 | Q21 | Can developer laptops (via corporate VPN/Direct Connect/TGW) **reach the dev account VPC**? If not, is SSM Session Manager port forwarding allowed? | Laptop → RDS path; whether a tunnel host is needed (+1 IP). See proposal/local-development.md §5.5. | **Answered:** Yes, laptops route to the dev VPC. Open tcp/5432 to a laptop/VPN prefix list only, per RDS SG, with TLS enforced (local-development.md §5.5). Exact CIDRs: Q27. |
 | Q22 | What is the **clean data DB**: a curated or synthetic reference set, or an extract of real (customer/personal) data? Who refreshes it, and how? | Whether it may be dumped to laptops to seed a local DB; the dev-reset job. | **Answered:** Clean holds real data. Laptops may *query* it but never copy it: named IAM logins, SELECT only, audited; local data comes from a seed-generator script; nothing is copied from clean (local-development.md §5.3–5.4, DEV-08). |
@@ -26,6 +26,11 @@ answer changes, so prioritise accordingly.
 | Q26 | Should dev be reset from a **masked/anonymised copy of clean** (needs a masking job and a data-owner sign-off), or from **synthetic fixtures** only (current proposal)? | Realism of dev data vs. a masking pipeline to build and own. | **Answered (superseded):** Dev isn't reset. It holds the dirty test data. Locally, a seed-generator script produces synthetic data; no data files are stored in the repo. |
 | Q27 | What are the **laptop / VPN client CIDR ranges** (as distinct from server ranges) for the RDS security-group prefix list? Does the VPN assign stable per-user addresses? | Width of the 5432 rule (local-development.md §5.5). | **Answered:** The VPN is always on, so the source is just the VPN client pool. Take the CIDR from the network team at build time. Stable per-user addresses aren't needed: identity comes from the DB login. |
 | Q28 | Does the **dirty test data on dev RDS** contain real personal or customer data? Where does it come from, and who refreshes it? | If yes, laptops connect to dev with per-person, audited logins (as clean), not the shared DML role (local-development.md §5.4). | **Answered:** No PII, but it holds samples of actual data. The shared DML-only role is fine; the no-copy rule still applies (local-development.md §5.4). Source and refresh owner are still to confirm. |
+| Q29 | Can CI read Argo CD application health from the managed capability's API (token or IAM)? | The post-sync metric gate and auto-revert (design.md §5.2). | _unanswered_ |
+| Q30 | How many free IPs does the **tooling** VPC have, and which subnets may the hub cluster and CodeConnections host use? | ~6 IPs in the tooling VPC (design.md §6). | _unanswered_ |
+| Q31 | Is there an IAM Identity Center instance we can use for Argo CD SSO, and which groups are Argo CD admins and viewers? | Required by the capability (design.md V4). | _unanswered_ |
+| Q32 | Do all customers have AWS accounts to pull from ECR, or do some need another route (IAM user, mirror)? | ADR-0007. | _unanswered_ |
+| Q33 | Which Artifactory repos (Docker, Helm OCI, generic) and Xray watches already exist, and is a JFrog OIDC integration for GHES allowed? | Workflow variables; OIDC vs tokens. | _unanswered_ |
 
 ## Medium impact
 
@@ -34,7 +39,7 @@ answer changes, so prioritise accordingly.
 | Q9 | Which customer platforms are **committed** vs hypothetical (GKE, Alibaba ACK, on-prem distro names/versions)? Any customers without Kubernetes? | PORT-02 test matrix. | **Answered:** On-prem Kubernetes is the customer platform that matters today. Distributions still to confirm (Q20). |
 | Q10 | Compliance regimes (e.g. ISO 27001, SOC 2, IRAP, government)? Who must approve prod releases? | DEP-02 approval design, audit retention, signing. | _unanswered_ |
 | Q11 | Availability target / SLO and acceptable maintenance windows? | Profiles, multi-AZ, ZDT strictness. | _unanswered_ |
-| Q12 | IaC tool in use (Terraform, OpenTofu, CDK, CloudFormation)? | ENV-04 implementation. | _unanswered_ |
+| Q12 | IaC tool in use (Terraform, OpenTofu, CDK, CloudFormation)? | ENV-04 implementation. | **Answered (2026-10-11):** CDK Terrain (cdktn) synthesising OpenTofu ≥ 1.13 (ADR-0005). |
 | Q13 | Session/state handling in the app: sticky sessions, websockets, long-running requests? | Drain timings, blue/green switch behaviour. | _unanswered_ |
 | Q14 | Is there a central **networking/hub account** with shared VPC endpoints and Route 53 resolvers? | Line H of the IP budget. | **Answered:** Not a constraint: VPC NAT/endpoints don't need budgeting. |
 
@@ -42,6 +47,6 @@ answer changes, so prioritise accordingly.
 
 | # | Question | Impact | Answer |
 |---|---|---|---|
-| Q15 | Preferred observability destination for internal envs (CloudWatch vs AMP/AMG vs existing tool)? | OBS-02 adapter choice. | _unanswered_ |
+| Q15 | Preferred observability destination for internal envs (CloudWatch vs AMP/AMG vs existing tool)? | OBS-02 adapter choice. | **Partly answered:** logs go to CloudWatch Logs via the Fargate log router; the owner asked for cheap and managed (ADR-0006). Metrics are still open. |
 | Q16 | Team size and on-call model for the platform? | Weight of operational simplicity. | _unanswered_ |
 | Q17 | Current monthly AWS cost per environment for the platform? | Before/after comparison. | _unanswered_ |

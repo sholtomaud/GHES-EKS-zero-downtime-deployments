@@ -1,0 +1,50 @@
+# infra: CDK Terrain → OpenTofu
+
+The AWS infrastructure for our own accounts, in [CDK Terrain](https://cdktn.io/docs)
+(cdktn) TypeScript, synthesised to **OpenTofu ≥ 1.13** root modules. Design:
+[docs/proposal/design.md](../docs/proposal/design.md) §9, [ADR-0005](../docs/adr/0005-iac-cdk-terrain-opentofu.md).
+**Proposed**: nothing here should be applied until ADR-0004 and ADR-0005 are accepted.
+
+## Run it
+
+From the repo root. The Makefile uses Apple `container` on macOS and Docker on
+Linux/CI. `CONTAINER=none` uses host tools instead (Node ≥ 22.18, OpenTofu ≥ 1.13,
+`cdktn`, `tsgo`; check with `make CONTAINER=none doctor`).
+
+| Command | Does |
+|---|---|
+| `make image` | Build the toolchain image (`Containerfile`) |
+| `make deps` | `npm ci` into `infra/node_modules` |
+| `make test` / `make coverage` | Unit tests (hermetic: no AWS, no network) |
+| `make typecheck` | TypeScript 7 (`tsgo -p .`) |
+| `make synth` | `cdktn synth` → `infra/cdktn.out/tofu/<stack>/*.tf` |
+| `make validate` | synth, then `tofu init -backend=false`, `validate` and `fmt -check` per stack |
+| `make plan STACK=workload-dev` | `tofu plan` (needs AWS credentials for that account) |
+| `make ci` | Everything CI runs |
+
+## Layout
+
+| Path | What |
+|---|---|
+| `src/config.ts` | Accounts, VPCs, environments. **PLACEHOLDER IDs**: replace before planning. |
+| `src/stacks/tooling-stack.ts` | Tooling account: ECR, GHES OIDC, CodeConnections, delivery hub, managed Argo CD |
+| `src/stacks/workload-stack.ts` | Each workload account: Fargate-only EKS, access, LB controller IRSA, logs, TLS |
+| `src/stacks/base.ts` | Backend, provider, naming (`snake_case`, `name:qualifier`), `Group` = output file |
+| `src/layout.ts` | Splits each stack into `terraform.tf`, `backend.tf`, `providers.tf`, `locals.tf`, `<group>.tf` |
+| `src/ip-budget.ts` | The IP budget as a tested function [NET-01/02] |
+| `test/` | Specs: requirements and layout rules |
+| `cdktn.out/tofu/<stack>/` | **Generated** OpenTofu. Plan and apply here. (`cdktn.out/stacks/` is cdktn's own JSON, for its CLI.) |
+
+## Working test-first
+
+1. Add or change a test in `test/` that states the requirement. Cite the ID, e.g. `[SEC-01]`.
+2. `make test` and watch it fail.
+3. Change `src/` until it passes. Then run `make validate`.
+
+A new resource goes in a `Group` (one output file per concern), and its
+construct id becomes its Terraform name. Use `name:qualifier` when two
+resources of different types share a name.
+
+Known noise: `cdktn synth` logs `flag provided but not defined: -v` and
+"Unable to determine Terraform version". The cdktn CLI probes `tofu -v`, which
+OpenTofu doesn't support. It's harmless.
