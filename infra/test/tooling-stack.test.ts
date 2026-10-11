@@ -5,57 +5,19 @@ import { ToolingStack } from "../src/stacks/tooling-stack.ts";
 import { tooling, workloads } from "../src/config.ts";
 import { synth, byName, resources, one, statements, condition, asArray } from "./helpers.ts";
 
-const cfg = { ...tooling, customerAccountIds: ["555555555555"] };
+const cfg = tooling;
 const s = synth(new ToolingStack(Testing.app(), "tooling", { tooling: cfg, workloads }));
-const noCustomers = synth(new ToolingStack(Testing.app(), "tooling", { tooling: { ...tooling, customerAccountIds: [] }, workloads }));
+const ecrArn = (prefix: string) => `arn:aws:ecr:${cfg.ecr.region}:${cfg.ecr.accountId}:repository/${prefix}/*`;
 const roles = byName(s, "aws_iam_role");
 
-describe("ECR release cache and customer distribution [REL-01] [REL-02]", () => {
-  const repos = byName(s, "aws_ecr_repository");
-  const expected = [...cfg.services, `charts/${cfg.chartName}`];
-
-  test("internal and release repositories for every service plus the chart, via for_each", () => {
-    assert.deepEqual(Object.keys(repos).sort(), ["internal", "release"]);
-    for (const tier of ["internal", "release"]) {
-      assert.match(repos[tier].for_each, /^\$\{toset\(\[/);
-      for (const name of expected) assert.ok(repos[tier].for_each.includes(`"${name}"`), `${tier}/${name}`);
-      assert.equal(repos[tier].name, `${tier}/\${each.value}`);
-    }
+describe("ECR already exists: this stack only references it [REL-01] [REL-02]", () => {
+  test("no ECR resources are created or managed here", () => {
+    for (const type of Object.keys(s.resource ?? {})) assert.ok(!type.startsWith("aws_ecr_"), type);
   });
 
-  test("every repository has immutable tags, so a tag can never move to a new digest", () => {
-    for (const r of Object.values(repos)) assert.equal(r.image_tag_mutability, "IMMUTABLE");
-  });
-
-  test("every repository has a lifecycle policy that keeps the last N releases", () => {
-    const lps = byName(s, "aws_ecr_lifecycle_policy");
-    for (const tier of ["internal", "release"]) {
-      assert.equal(lps[tier].for_each, `\${aws_ecr_repository.${tier}}`);
-      assert.match(lps[tier].policy, /^\$\{jsonencode\(/);
-      assert.ok(lps[tier].policy.includes(`"countNumber" = ${cfg.imagesRetained}`));
-      assert.ok(lps[tier].policy.includes(`"countType" = "imageCountMoreThan"`));
-    }
-  });
-
-  test("internal repos are readable by workload accounts only; release repos by customers only", () => {
-    const rps = byName(s, "aws_ecr_repository_policy");
-    const expectPrincipals = {
-      internal: workloads.map((w) => `arn:aws:iam::${w.accountId}:root`),
-      release: cfg.customerAccountIds.map((a) => `arn:aws:iam::${a}:root`),
-    };
-    for (const tier of ["internal", "release"] as const) {
-      assert.equal(rps[tier].for_each, `\${aws_ecr_repository.${tier}}`);
-      const [st] = statements(s, rps[tier].policy);
-      const p = asArray<any>(st.principals)[0];
-      assert.equal(p.type, "AWS");
-      assert.deepEqual(p.identifiers.sort(), expectPrincipals[tier].sort());
-      assert.ok(!p.identifiers.includes("*"), "no public pull");
-      assert.deepEqual(st.actions.sort(), ["ecr:BatchCheckLayerAvailability", "ecr:BatchGetImage", "ecr:GetDownloadUrlForLayer"]);
-    }
-  });
-
-  test("with no customers yet, release repos get no pull policy (an empty principal list is invalid)", () => {
-    assert.deepEqual(Object.keys(byName(noCustomers, "aws_ecr_repository_policy")), ["internal"]);
+  test("the ECR the stacks point at is configuration, with separate internal and release prefixes", () => {
+    assert.match(cfg.ecr.accountId, /^\d{12}$/);
+    assert.notEqual(cfg.ecr.internalPrefix, cfg.ecr.releasePrefix);
   });
 });
 
@@ -89,8 +51,8 @@ describe("GHES OIDC and promotion roles [DEP-04]", () => {
   test("internal role pushes to internal/* only; GA role to release/* only", () => {
     const pushes = byName(s, "aws_iam_role_policy");
     const scope = (name: string) => statements(s, pushes[name].policy).find((x) => x.actions.includes("ecr:PutImage")).resources;
-    assert.deepEqual(scope("ghes_promote_internal"), [`arn:aws:ecr:${cfg.region}:${cfg.accountId}:repository/internal/*`]);
-    assert.deepEqual(scope("ghes_publish_ga"), [`arn:aws:ecr:${cfg.region}:${cfg.accountId}:repository/release/*`]);
+    assert.deepEqual(scope("ghes_promote_internal"), [ecrArn(cfg.ecr.internalPrefix)]);
+    assert.deepEqual(scope("ghes_publish_ga"), [ecrArn(cfg.ecr.releasePrefix)]);
   });
 });
 
@@ -146,7 +108,7 @@ describe("Managed Argo CD on a zero-pod hub cluster [DEP-03] [DEP-07] [OPS-03]",
     assert.ok(actions.includes("codeconnections:UseConnection"));
     assert.ok(!actions.some((a: string) => a.endsWith(":*") || a === "*"), "no wildcard actions");
     const ecr = stmts.find((x) => x.actions.includes("ecr:BatchGetImage"));
-    assert.deepEqual(ecr.resources, [`arn:aws:ecr:${cfg.region}:${cfg.accountId}:repository/internal/*`]);
+    assert.deepEqual(ecr.resources, [ecrArn(cfg.ecr.internalPrefix)]);
     const cc = stmts.find((x) => x.actions.includes("codeconnections:UseConnection"));
     assert.deepEqual(cc.resources, ["${aws_codeconnections_connection.deploy_repo.arn}"]);
   });
@@ -176,11 +138,13 @@ describe("CodeConnections host for the private GHES", () => {
 });
 
 describe("state and tagging", () => {
-  test("S3 backend with encryption and native lockfile", () => {
-    const b = s.terraform!.backend.s3;
-    assert.equal(b.bucket, cfg.state.bucket);
-    assert.equal(b.encrypt, true);
-    assert.equal(b.use_lockfile, true);
+  test("state lives in Artifactory's Terraform backend repository, one workspace per stack", () => {
+    assert.deepEqual(Object.keys(s.terraform!.backend), ["remote"]);
+    const b = s.terraform!.backend.remote;
+    assert.equal(b.hostname, cfg.state.hostname);
+    assert.equal(b.organization, cfg.state.repository);
+    assert.deepEqual(b.workspaces, { name: "tooling" });
+    assert.equal(b.token, undefined, "no token in config: TF_TOKEN_<host> or tofu login");
   });
 
   test("provider applies default tags to every resource", () => {

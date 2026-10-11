@@ -6,7 +6,8 @@
 #
 #   make ci                      image + deps + typecheck + test + synth + validate
 #   make test                    unit tests (hermetic: no AWS, no network)
-#   make plan STACK=workload-dev tofu plan for one stack (needs AWS credentials)
+#   make plan STACK=workload-dev tofu plan for one stack (needs AWS credentials
+#                                and TF_TOKEN_<artifactory_host> for the state)
 #   make shell                   interactive shell in the toolchain container
 
 UNAME_S := $(shell uname -s)
@@ -29,8 +30,9 @@ ifeq ($(CONTAINER),docker)
 endif
 # Pass AWS credentials through by NAME only (`-e VAR`), so values never appear
 # in the echoed command or CI logs. Only variables that are set are passed.
+# TF_TOKEN_<host> is the Artifactory token for the OpenTofu state backend.
 AWS_VARS := AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN AWS_REGION AWS_DEFAULT_REGION
-RUN_FLAGS += $(foreach v,$(AWS_VARS),$(if $($(v)),-e $(v)))
+RUN_FLAGS += $(foreach v,$(AWS_VARS) $(filter TF_TOKEN_%,$(.VARIABLES)),$(if $($(v)),-e $(v)))
 
 ifeq ($(CONTAINER),none)
   RUN := cd infra && TERRAFORM_BINARY_NAME="$(CURDIR)/infra/scripts/tofu-cdktn" CHECKPOINT_DISABLE=1

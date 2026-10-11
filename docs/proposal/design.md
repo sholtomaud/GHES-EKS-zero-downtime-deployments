@@ -54,12 +54,12 @@ flowchart LR
 |---|---|---|
 | Build, test, scan | GHES Actions with the **SonarQube Server** action, **JFrog CLI** (`setup-jfrog-cli`, OIDC) and **Xray** build scan | GHES/Artifactory: fixed, self-hosted |
 | Release unit | One Helm chart pinning all 8 digests (`digests.json` inside the chart), in Artifactory as OCI, recorded in **build-info** with the images | — |
-| Runtime registry | **ECR**, copied from Artifactory by digest at promotion: `internal/*` for our envs, `release/*` for customers | ECR ✅ |
+| Runtime registry | **The existing ECR** (we don't create or manage it), copied into from Artifactory by digest at promotion: `internal/*` for our envs, `release/*` for customers | ECR ✅ |
 | Deploy (our envs) | **EKS Capability for Argo CD** on a zero-pod hub cluster in the tooling account. Pulls Git via **CodeConnections**, charts from ECR via IAM, deploys to workload clusters via **EKS access entries** | ✅ |
 | Promotion | GHES Environment approval → copy to ECR → one commit to the deploy repo | — |
 | Compute | **EKS, every pod on Fargate**: 1 IP per pod, no nodes, no DaemonSets | ✅ |
 | Logs / debug | Fargate's **built-in** Fluent Bit → **CloudWatch Logs**: Standard class in dev/nonprod (Live Tail), Infrequent Access in prod. `kubectl logs`/`exec` for live debugging. | ✅ |
-| IaC | **cdktn** (TypeScript) → **OpenTofu ≥ 1.13** root modules, one per account, state in S3 with native locking | — |
+| IaC | **cdktn** (TypeScript) → **OpenTofu ≥ 1.13** root modules, one per account, state in **Artifactory** (Terraform Backend repository) | — |
 | Customers | Pull the GA chart from ECR `release/*`, install with Helm. No Argo CD, no GitOps, no AWS services required. | — |
 
 **IP cost in a workload account: 19 at steady state and 33 at peak (`minimal`).**
@@ -305,7 +305,7 @@ environment that's about **$15/month in dev or nonprod and $8/month in prod**.
 | **EKS Capability: Argo CD** | AWS-owned infra, on `delivery-hub` | 0 | 0 | DEP-02/03/06/09, OPS-03, O1 | **AWS-managed** |
 | `delivery-hub` EKS control plane | Tooling account | 0 | 0 (tooling: 2–4) | Hosts the capability's CRDs | Platform, with EKS upgrades |
 | CodeConnections host + connection | Tooling VPC | 0 | 0 (tooling: 2) | Argo CD → private GHES | AWS-managed |
-| ECR `internal/*`, `release/*` | Tooling account | — | 0 | REL-01/02, ZDT-02 (rollback without Artifactory), O8 | AWS-managed |
+| ECR `internal/*`, `release/*` | **Existing, owned outside this repo** | — | 0 | REL-01/02, ZDT-02 (rollback without Artifactory), O8 | ECR owner. We rely on: immutable tags, a lifecycle rule keeping ≥ 10 releases, and a repo policy letting the workload accounts (Fargate pod execution roles), the Argo CD capability role and customer accounts pull. Our IaC only grants our roles access to these prefixes. |
 | ALB (one per env, IngressGroup), ACM | Workload | — | 2–8 | ZDT-07, ENV-04 | AWS-managed |
 | CloudWatch log group | Workload | — | 0 | OBS-* | AWS-managed |
 | GHES, Artifactory, Xray, SonarQube | Tooling (fixed) | — | 0 | ADR-0001 | Existing owners |
@@ -321,9 +321,9 @@ Prometheus stack, no cert-manager, no external-dns.
 |---|---|
 | Language/tool | **CDK Terrain** `cdktn` 0.24.0 + `@cdktn/provider-aws` 25.7.2 (wraps `hashicorp/aws` 6.68.0), TypeScript run natively by Node (type stripping) |
 | Engine | **OpenTofu ≥ 1.13** (`required_version` in every stack, `targetVersions` in `cdktf.json`). The image ships 1.13.1. |
-| Stacks = root modules = state | `tooling`, `workload-dev`, `workload-nonprod`, `workload-prod`, each with its own S3 state, `use_lockfile`, `allowed_account_ids` |
+| Stacks = root modules = state | `tooling`, `workload-dev`, `workload-nonprod`, `workload-prod`. State lives in **Artifactory's Terraform Backend repository** (`backend "remote"`, built-in locking and state history), one workspace per stack. Token via `tofu login` locally, `TF_TOKEN_<host>` in CI; never in config. `allowed_account_ids` pins each provider to its account. |
 | Output | `cdktn synth` writes **conventional root modules** to `infra/cdktn.out/tofu/<stack>/`, then `tofu fmt`s them |
-| Tests | `node:test`. Specs were written first and failed (commit `596d90d`), then the stacks made them pass. 69 tests: requirements as assertions (IP budget, immutability, read-only humans, IRSA scope, log retention, OpenTofu floor) **plus layout rules** (no `main.tf`, ≤ 200 lines per file, bare references, `for_each` first, no inline JSON policies). |
+| Tests | `node:test`. Specs were written first and failed (commit `596d90d`), then the stacks made them pass. 66 tests: requirements as assertions (IP budget, no ECR created here, push/pull scoped to the existing ECR prefixes, read-only humans, IRSA scope, log retention, OpenTofu floor) **plus layout rules** (no `main.tf`, ≤ 200 lines per file, bare references, `for_each` first, no inline JSON policies). |
 | Toolchain | `Containerfile`: Node 24.21, OpenTofu 1.13.1 (checksum-verified, amd64/arm64), cdktn-cli 0.24.0, TypeScript 7.0.2 (`tsgo`) |
 | Entry point | `Makefile`: Apple `container` on macOS, Docker on Linux/CI, `CONTAINER=none` for host tools. `make ci` = image, doctor, deps, typecheck, coverage, validate. |
 | CI | [`infra.yml`](../../.github/workflows/infra.yml): `make` targets in the image, artefact upload, SonarQube (once configured) |
@@ -333,7 +333,7 @@ Synthesised layout for one workload account:
 ```
 cdktn.out/tofu/workload-dev/
 ├── terraform.tf                  required_version >= 1.13.0, aws = 6.68.0
-├── backend.tf                    S3, encrypt, use_lockfile
+├── backend.tf                    remote → Artifactory, workspace "workload-dev"
 ├── providers.tf                  region, allowed_account_ids, default_tags
 ├── locals.tf                     oidc_issuer_host, access_principals
 ├── eks.tf                        cluster role, cluster, OIDC provider
@@ -361,7 +361,7 @@ ADR-0005 accepted.
 | DEP-04 | OIDC roles pinned to repo + environment | `tooling-stack.test.ts` |
 | DEP-05 | Private endpoints; Argo uses access entries | `workload-stack.test.ts` |
 | DEP-07 | 0 resident delivery pods | Component register; pod inventory |
-| REL-02 | Immutable ECR tags; digests verified on copy | Tests + promote workflow |
+| REL-02 | Immutable ECR tags (ECR owner); digests verified on copy | Promote workflow |
 | SEC-01 | Humans view-only; only Argo CD and break-glass are admin | `workload-stack.test.ts` |
 | SEC-05 | IRSA scoped to `kube-system/aws-load-balancer-controller` | `workload-stack.test.ts` |
 | OBS-04 | 0 observability pods | Test: no observability add-ons |
@@ -410,4 +410,5 @@ Also added to [06-open-questions.md](../06-open-questions.md).
 | Q30 | How many free IPs does the tooling VPC have, and which subnets can the hub and CodeConnections use? | §6 tooling line |
 | Q31 | Is there an Identity Center instance (account or org) usable for Argo CD SSO? | V4 |
 | Q32 | Do customers have AWS accounts for ECR pull, or do some need IAM users or a pull-through mirror? | ADR-0007 |
+| Q34 | Which account and region hold the existing ECR, and does its owner already keep tags immutable, keep ≥ 10 releases, and allow cross-account pull for our workload accounts and the Argo CD capability role? | Fargate image pulls, Argo CD chart pulls, rollback without Artifactory (design.md §8) |
 | Q33 | Which Artifactory repos (Docker, Helm OCI, generic) and Xray watches already exist? | Workflow vars |

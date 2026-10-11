@@ -18,11 +18,12 @@ As PROPOSAL §2.5: A, expose Artifactory; **B, ECR**; C, a hosted registry.
 ## Decision
 
 Option B. The GHES promote workflow copies each **GA** release (8 images and
-the chart) from Artifactory into **ECR `release/*`** in the tooling account,
+the chart) from Artifactory into the **existing ECR** under `release/*`,
 by digest and with referrers (`oras cp -r`), after the `ga` GHES Environment
 approval. Customer AWS accounts get read-only pull through the repository
-policy. Internal releases go to `internal/*`, which customers can't see. Tags
-are immutable.
+policy, which the ECR owner maintains (this repo doesn't create or manage
+the ECR). Internal releases go to `internal/*`, which customers can't see.
+Tags must be immutable (ECR owner, Q34).
 
 ## Consequences
 
@@ -30,7 +31,7 @@ are immutable.
 - Negative: ECR auth needs an AWS principal, and tokens last 12 h. Customers
   without AWS accounts need another route (Q32), or a mirror that refreshes
   ECR credentials.
-- Follow-ups: a per-customer onboarding runbook (add the account ID to `customerAccountIds`).
+- Follow-ups: a per-customer onboarding runbook (the ECR owner adds the customer account to the `release/*` pull policy).
 
 ## Verification
 
@@ -39,4 +40,4 @@ can't pull `internal/*`.
 
 ## References
 
-PROPOSAL.md §2.5; `infra/src/stacks/tooling-stack.ts` (ecr.tf).
+PROPOSAL.md §2.5; push roles in `infra/src/stacks/tooling-stack.ts` (ghes_oidc.tf).

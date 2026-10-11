@@ -31,6 +31,7 @@ answer changes, so prioritise accordingly.
 | Q31 | Is there an IAM Identity Center instance we can use for Argo CD SSO, and which groups are Argo CD admins and viewers? | Required by the capability (design.md V4). | _unanswered_ |
 | Q32 | Do all customers have AWS accounts to pull from ECR, or do some need another route (IAM user, mirror)? | ADR-0007. | _unanswered_ |
 | Q33 | Which Artifactory repos (Docker, Helm OCI, generic) and Xray watches already exist, and is a JFrog OIDC integration for GHES allowed? | Workflow variables; OIDC vs tokens. | _unanswered_ |
+| Q34 | Which account and region hold the existing ECR, and does its owner keep tags immutable, keep ≥ 10 releases, and allow cross-account pull for our workload accounts and the Argo CD capability role? | Fargate and Argo CD pulls; rollback without Artifactory (design.md §8). Config: `infra/src/config.ts` `ecr`. | _unanswered_ |
 
 ## Medium impact
 

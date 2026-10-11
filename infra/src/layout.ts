@@ -182,12 +182,20 @@ function terraformFile(tf: any): string {
   return `terraform {\n  required_version = ${hclValue(tf.required_version)}\n\n  required_providers {\n${providers}\n  }\n}\n`;
 }
 
+/** Backend settings: scalars as attributes, nested objects (e.g. `workspaces`) as blocks. */
+function backendBody(cfg: Record<string, unknown>, indent: string): string {
+  return Object.entries(cfg)
+    .map(([k, v]) =>
+      v !== null && typeof v === "object"
+        ? `${indent}${k} {\n${backendBody(v as Record<string, unknown>, indent + "  ")}\n${indent}}`
+        : `${indent}${k} = ${hclValue(v)}`,
+    )
+    .join("\n");
+}
+
 function backendFile(tf: any): string {
   const [[kind, cfg]] = Object.entries(tf.backend ?? {}) as [string, Record<string, unknown>][];
-  const attrs = Object.entries(cfg)
-    .map(([k, v]) => `    ${k} = ${hclValue(v)}`)
-    .join("\n");
-  return `terraform {\n  backend ${JSON.stringify(kind)} {\n${attrs}\n  }\n}\n`;
+  return `terraform {\n  backend ${JSON.stringify(kind)} {\n${backendBody(cfg, "    ")}\n  }\n}\n`;
 }
 
 // --- layout ------------------------------------------------------------------

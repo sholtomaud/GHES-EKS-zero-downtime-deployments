@@ -38,8 +38,8 @@ test("every stack pins the AWS provider to an exact version", () => {
   }
 });
 
-test("each stack's state lives in its own key", () => {
-  const keys = stacks.map((s) => synthOf(s).terraform.backend.s3.key);
+test("each stack's state lives in its own Artifactory workspace", () => {
+  const keys = stacks.map((s) => synthOf(s).terraform.backend.remote.workspaces.name);
   assert.equal(new Set(keys).size, keys.length);
 });
 
