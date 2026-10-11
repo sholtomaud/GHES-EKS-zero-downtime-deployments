@@ -1,0 +1,9 @@
+#!/bin/sh
+# The OpenTofu binary cdktn calls (TERRAFORM_BINARY_NAME=tofu-cdktn).
+# The cdktn CLI probes the engine with `-v`, which Terraform accepts but
+# OpenTofu rejects ("flag provided but not defined: -v"). Translate that one
+# call; pass everything else to tofu unchanged.
+if [ "$#" -eq 1 ] && [ "$1" = "-v" ]; then
+  set -- -version
+fi
+exec tofu "$@"

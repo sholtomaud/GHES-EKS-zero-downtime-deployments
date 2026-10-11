@@ -20,7 +20,9 @@ IMAGE      ?= infra-toolchain:local
 NODE_IMAGE ?= docker.io/library/node:24.21.0-bookworm-slim
 STACK      ?=
 
-RUN_FLAGS := --rm -v "$(CURDIR)":/work -w /work/infra
+# cdktn calls OpenTofu through infra/scripts/tofu-cdktn (it probes with `-v`,
+# which OpenTofu rejects). One copy, used in the container and on the host.
+RUN_FLAGS := --rm -v "$(CURDIR)":/work -w /work/infra -e TERRAFORM_BINARY_NAME=/work/infra/scripts/tofu-cdktn
 # Docker on Linux: write files as the invoking user, not root.
 ifeq ($(CONTAINER),docker)
   RUN_FLAGS += --user $(shell id -u):$(shell id -g)
@@ -31,7 +33,7 @@ AWS_VARS := AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN AWS_REGION
 RUN_FLAGS += $(foreach v,$(AWS_VARS),$(if $($(v)),-e $(v)))
 
 ifeq ($(CONTAINER),none)
-  RUN := cd infra && TERRAFORM_BINARY_NAME=tofu CHECKPOINT_DISABLE=1
+  RUN := cd infra && TERRAFORM_BINARY_NAME="$(CURDIR)/infra/scripts/tofu-cdktn" CHECKPOINT_DISABLE=1
 else
   RUN := $(CONTAINER) run $(RUN_FLAGS) $(IMAGE)
 endif
@@ -80,8 +82,8 @@ test: ## Run the infra unit tests
 coverage: ## Unit tests with lcov coverage (infra/coverage/lcov.info, read by SonarQube)
 	$(RUN) sh -c 'mkdir -p coverage && npm run test:coverage'
 
-synth: ## Synthesise OpenTofu JSON into infra/cdktn.out
-	$(RUN) cdktn synth
+synth: ## Synthesise OpenTofu root modules into infra/cdktn.out/tofu (fails on cdktn [ERROR] lines)
+	$(RUN) bash scripts/synth.sh
 
 validate: synth ## tofu init -backend=false && tofu validate for every stack
 	$(RUN) bash scripts/validate.sh

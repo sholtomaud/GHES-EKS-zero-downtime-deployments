@@ -17,7 +17,7 @@ Linux/CI. `CONTAINER=none` uses host tools instead (Node ≥ 22.18, OpenTofu ≥
 | `make deps` | `npm ci` into `infra/node_modules` |
 | `make test` / `make coverage` | Unit tests (hermetic: no AWS, no network) |
 | `make typecheck` | TypeScript 7 (`tsgo -p .`) |
-| `make synth` | `cdktn synth` → `infra/cdktn.out/tofu/<stack>/*.tf` |
+| `make synth` | `cdktn synth` → `infra/cdktn.out/tofu/<stack>/*.tf`; fails on any cdktn `[ERROR]` |
 | `make validate` | synth, then `tofu init -backend=false`, `validate` and `fmt -check` per stack |
 | `make plan STACK=workload-dev` | `tofu plan` (needs AWS credentials for that account) |
 | `make ci` | Everything CI runs |
@@ -45,6 +45,6 @@ A new resource goes in a `Group` (one output file per concern), and its
 construct id becomes its Terraform name. Use `name:qualifier` when two
 resources of different types share a name.
 
-Known noise: `cdktn synth` logs `flag provided but not defined: -v` and
-"Unable to determine Terraform version". The cdktn CLI probes `tofu -v`, which
-OpenTofu doesn't support. It's harmless.
+`cdktn synth` must log no `[ERROR]` lines: `scripts/synth.sh` fails the build if
+it does. The cdktn CLI probes the engine with `tofu -v`, which OpenTofu rejects,
+so cdktn calls `scripts/tofu-cdktn`, a 3-line shim that maps `-v` to `-version`.

@@ -8,6 +8,9 @@ export TF_PLUGIN_CACHE_DIR="${TF_PLUGIN_CACHE_DIR:-$PWD/.tofu-plugin-cache}"
 mkdir -p "$TF_PLUGIN_CACHE_DIR"
 
 tofu version | head -1
+# The engine cdktn calls must answer its `-v` probe (see scripts/tofu-cdktn).
+"${TERRAFORM_BINARY_NAME:-tofu}" -v | grep -q '^OpenTofu v1\.' \
+  || { echo "TERRAFORM_BINARY_NAME=${TERRAFORM_BINARY_NAME:-tofu} does not answer -v with an OpenTofu version" >&2; exit 1; }
 for dir in "$out"/*/; do
   stack="$(basename "$dir")"
   echo "== $stack"
