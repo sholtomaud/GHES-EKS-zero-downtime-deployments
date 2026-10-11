@@ -3,19 +3,22 @@ import assert from "node:assert/strict";
 import { Testing } from "cdktn";
 import { WorkloadStack } from "../src/stacks/workload-stack.ts";
 import { tooling, workloads, argocdCapabilityRoleArn, names } from "../src/config.ts";
-import { synth, resources, one, policy, asArray } from "./helpers.ts";
+import { synth, byName, resources, one, statements, condition, asArray } from "./helpers.ts";
 
 const dev = { ...workloads[0], tls: { domainName: "dev.app.example.com", hostedZoneId: "Z0000000000000" } };
 const prod = workloads.find((w) => w.name === "prod")!;
-const s = synth(new WorkloadStack(Testing.app(), "workload-dev", { env: dev, tooling }));
+const devStack = new WorkloadStack(Testing.app(), "workload-dev", { env: dev, tooling });
+const s = synth(devStack);
 const sProd = synth(new WorkloadStack(Testing.app(), "workload-prod", { env: prod, tooling }));
+const roles = byName(s, "aws_iam_role");
 
 const ADMIN = "arn:aws:eks::aws:cluster-access-policy/AmazonEKSClusterAdminPolicy";
 const VIEW = "arn:aws:eks::aws:cluster-access-policy/AmazonEKSAdminViewPolicy";
 
 describe("cluster [NET-06] [DEP-05] [OPS-02]", () => {
+  const c = one(s, "aws_eks_cluster");
+
   test("exactly one cluster per environment, private endpoint only", () => {
-    const c = one(s, "aws_eks_cluster");
     assert.equal(c.name, "app-dev");
     assert.equal(c.version, dev.kubernetesVersion);
     assert.equal(c.vpc_config.endpoint_public_access, false);
@@ -24,17 +27,16 @@ describe("cluster [NET-06] [DEP-05] [OPS-02]", () => {
   });
 
   test("access entries only (no aws-auth ConfigMap), and the creator is not silently admin", () => {
-    const c = one(s, "aws_eks_cluster");
     assert.equal(c.access_config.authentication_mode, "API");
     assert.equal(c.access_config.bootstrap_cluster_creator_admin_permissions, false);
   });
 
   test("standard support only: no extended-support fees [OPS-02]", () => {
-    assert.equal(one(s, "aws_eks_cluster").upgrade_policy.support_type, "STANDARD");
+    assert.equal(c.upgrade_policy.support_type, "STANDARD");
   });
 
   test("control-plane logs limited to audit and authenticator (cost)", () => {
-    assert.deepEqual(one(s, "aws_eks_cluster").enabled_cluster_log_types.sort(), ["audit", "authenticator"]);
+    assert.deepEqual([...c.enabled_cluster_log_types].sort(), ["audit", "authenticator"]);
   });
 });
 
@@ -44,8 +46,7 @@ describe("compute: every pod on Fargate [NET-01] [NET-03]", () => {
       assert.equal(resources(s, t).length, 0, t);
     }
     assert.equal(one(s, "aws_eks_cluster").bootstrap_self_managed_addons, false);
-    const addons = resources(s, "aws_eks_addon").map((a) => a.addon_name);
-    assert.deepEqual(addons, ["coredns"]);
+    assert.deepEqual(resources(s, "aws_eks_addon").map((a) => a.addon_name), ["coredns"]);
   });
 
   test("Fargate profiles cover kube-system and the app namespace, in private subnets", () => {
@@ -57,63 +58,63 @@ describe("compute: every pod on Fargate [NET-01] [NET-03]", () => {
 
   test("CoreDNS is the managed add-on, scheduled on Fargate", () => {
     const a = one(s, "aws_eks_addon");
-    assert.deepEqual(JSON.parse(a.configuration_values), { computeType: "Fargate" });
+    assert.equal(a.configuration_values, '${jsonencode({"computeType" = "Fargate"})}');
     assert.ok(asArray<string>(a.depends_on).some((d) => d.startsWith("aws_eks_fargate_profile.")));
   });
 
   test("pod execution role is confused-deputy safe (SourceArn scoped to this cluster's profiles)", () => {
-    const role = resources(s, "aws_iam_role").find((r) => r.name === "app-dev-fargate-pod-execution")!;
-    const st = policy(role.assume_role_policy).Statement[0];
-    assert.equal(st.Principal.Service, "eks-fargate-pods.amazonaws.com");
-    assert.match(st.Condition.ArnLike["aws:SourceArn"], /:fargateprofile\/app-dev\/\*$/);
+    const [st] = statements(s, roles.fargate_pod_execution.assume_role_policy);
+    assert.deepEqual(asArray<any>(st.principals)[0].identifiers, ["eks-fargate-pods.amazonaws.com"]);
+    assert.match(condition(st, "ArnLike", "aws:SourceArn")![0], /:fargateprofile\/app-dev\/\*$/);
   });
 });
 
 describe("delivery: managed Argo CD from the tooling account [DEP-03] [DEP-04] [SEC-01]", () => {
-  const entries = resources(s, "aws_eks_access_entry");
-  const assoc = resources(s, "aws_eks_access_policy_association");
+  const principals = s.locals!.access_principals as Record<string, { principal_arn: string; policy_arn: string }>;
 
-  test("the Argo CD capability role is granted cluster access via an access entry", () => {
-    const arn = argocdCapabilityRoleArn(tooling);
-    assert.ok(entries.some((e) => e.principal_arn === arn));
-    assert.ok(assoc.some((a) => a.principal_arn === arn && a.policy_arn === ADMIN));
+  test("access entries and policy associations iterate over one principals map", () => {
+    assert.equal(byName(s, "aws_eks_access_entry").principals.for_each, "${local.access_principals}");
+    assert.equal(byName(s, "aws_eks_access_policy_association").principals.for_each, "${local.access_principals}");
+  });
+
+  test("the Argo CD capability role from the tooling account is cluster admin", () => {
+    assert.deepEqual(principals.argocd, { principal_arn: argocdCapabilityRoleArn(tooling), policy_arn: ADMIN });
   });
 
   test("humans are read-only; only Argo CD and break-glass can write", () => {
-    const admins = assoc.filter((a) => a.policy_arn === ADMIN).map((a) => a.principal_arn).sort();
+    const admins = Object.values(principals).filter((p) => p.policy_arn === ADMIN).map((p) => p.principal_arn).sort();
     assert.deepEqual(admins, [argocdCapabilityRoleArn(tooling), dev.access.breakGlassRoleArn].sort());
     for (const ro of dev.access.readOnlyRoleArns) {
-      assert.ok(assoc.some((a) => a.principal_arn === ro && a.policy_arn === VIEW));
+      assert.ok(Object.values(principals).some((p) => p.principal_arn === ro && p.policy_arn === VIEW));
     }
   });
 });
 
 describe("AWS Load Balancer Controller identity [SEC-05] [ZDT-07]", () => {
   test("IRSA: cluster OIDC provider plus a role bound to kube-system/aws-load-balancer-controller", () => {
-    one(s, "aws_iam_openid_connect_provider");
-    const role = resources(s, "aws_iam_role").find((r) => r.name === "app-dev-aws-load-balancer-controller")!;
-    const st = policy(role.assume_role_policy).Statement[0];
-    assert.equal(st.Action, "sts:AssumeRoleWithWebIdentity");
-    const eq = st.Condition.StringEquals;
-    const subKey = Object.keys(eq).find((k) => k.endsWith(":sub"))!;
-    assert.equal(eq[subKey], "system:serviceaccount:kube-system:aws-load-balancer-controller");
-    assert.equal(eq[subKey.replace(/:sub$/, ":aud")], "sts.amazonaws.com");
+    assert.equal(one(s, "aws_iam_openid_connect_provider").url, "${aws_eks_cluster.this.identity[0].oidc[0].issuer}");
+    const [st] = statements(s, roles.load_balancer_controller.assume_role_policy);
+    assert.deepEqual(st.actions, ["sts:AssumeRoleWithWebIdentity"]);
+    assert.deepEqual(condition(st, "StringEquals", "${local.oidc_issuer_host}:sub"), ["system:serviceaccount:kube-system:aws-load-balancer-controller"]);
+    assert.deepEqual(condition(st, "StringEquals", "${local.oidc_issuer_host}:aud"), ["sts.amazonaws.com"]);
   });
 
-  test("controller policy is the pinned upstream policy, not AdministratorAccess", () => {
-    const p = resources(s, "aws_iam_policy").find((x) => x.name === "app-dev-aws-load-balancer-controller")!;
-    assert.ok(policy(p.policy).Statement.length > 5);
-    const attached = resources(s, "aws_iam_role_policy_attachment").map((a) => a.policy_arn);
-    assert.ok(!attached.some((a) => /AdministratorAccess/.test(a)));
+  test("controller policy is the pinned upstream policy shipped as a file, not AdministratorAccess", () => {
+    const p = byName(s, "aws_iam_policy").load_balancer_controller;
+    assert.equal(p.policy, '${file("${path.module}/policies/aws-load-balancer-controller.json")}');
+    const doc = JSON.parse(devStack.files.get("policies/aws-load-balancer-controller.json")!);
+    assert.ok(doc.Statement.length > 5);
+    assert.ok(!resources(s, "aws_iam_role_policy_attachment").some((a) => /AdministratorAccess/.test(a.policy_arn)));
   });
 });
 
 describe("logging and debugging [OBS-01] [OBS-02] [OBS-04]", () => {
   test("one pre-created container log group with the environment's class and retention", () => {
-    const g = resources(s, "aws_cloudwatch_log_group").find((x) => x.name === names.logGroup("dev"))!;
+    const g = byName(s, "aws_cloudwatch_log_group").containers;
+    assert.equal(g.name, names.logGroup("dev"));
     assert.equal(g.retention_in_days, 7);
     assert.equal(g.log_group_class, "STANDARD");
-    const gp = resources(sProd, "aws_cloudwatch_log_group").find((x) => x.name === names.logGroup("prod"))!;
+    const gp = byName(sProd, "aws_cloudwatch_log_group").containers;
     assert.equal(gp.log_group_class, "INFREQUENT_ACCESS");
     assert.equal(gp.retention_in_days, 30);
   });
@@ -123,11 +124,9 @@ describe("logging and debugging [OBS-01] [OBS-02] [OBS-04]", () => {
   });
 
   test("the Fargate log router can write only to that log group, and cannot create groups", () => {
-    const p = resources(s, "aws_iam_role_policy").find((x) => x.name === "fargate-log-router")!;
-    const st = policy(p.policy).Statement;
-    const actions = st.flatMap((x: any) => x.Action).sort();
-    assert.deepEqual(actions, ["logs:CreateLogStream", "logs:DescribeLogStreams", "logs:PutLogEvents"]);
-    for (const x of st) for (const r of asArray<string>(x.Resource)) assert.match(r, /aws_cloudwatch_log_group\./);
+    const st = statements(s, byName(s, "aws_iam_role_policy").fargate_log_router.policy);
+    assert.deepEqual(st.flatMap((x) => x.actions).sort(), ["logs:CreateLogStream", "logs:DescribeLogStreams", "logs:PutLogEvents"]);
+    for (const x of st) for (const r of x.resources) assert.match(r, /aws_cloudwatch_log_group\.containers\.arn/);
   });
 
   test("no in-cluster observability stack is provisioned", () => {

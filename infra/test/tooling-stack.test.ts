@@ -3,56 +3,64 @@ import assert from "node:assert/strict";
 import { Testing } from "cdktn";
 import { ToolingStack } from "../src/stacks/tooling-stack.ts";
 import { tooling, workloads } from "../src/config.ts";
-import { synth, resources, one, policy, asArray } from "./helpers.ts";
+import { synth, byName, resources, one, statements, condition, asArray } from "./helpers.ts";
 
 const cfg = { ...tooling, customerAccountIds: ["555555555555"] };
 const s = synth(new ToolingStack(Testing.app(), "tooling", { tooling: cfg, workloads }));
-const roles = resources(s, "aws_iam_role");
+const noCustomers = synth(new ToolingStack(Testing.app(), "tooling", { tooling: { ...tooling, customerAccountIds: [] }, workloads }));
+const roles = byName(s, "aws_iam_role");
 
 describe("ECR release cache and customer distribution [REL-01] [REL-02]", () => {
-  const repos = resources(s, "aws_ecr_repository");
+  const repos = byName(s, "aws_ecr_repository");
+  const expected = [...cfg.services, `charts/${cfg.chartName}`];
 
-  test("internal/ and release/ repositories for every service plus the chart", () => {
-    const names = repos.map((r) => r.name).sort();
-    const expected = [...cfg.services, `charts/${cfg.chartName}`]
-      .flatMap((n) => [`internal/${n}`, `release/${n}`])
-      .sort();
-    assert.deepEqual(names, expected);
+  test("internal and release repositories for every service plus the chart, via for_each", () => {
+    assert.deepEqual(Object.keys(repos).sort(), ["internal", "release"]);
+    for (const tier of ["internal", "release"]) {
+      assert.match(repos[tier].for_each, /^\$\{toset\(\[/);
+      for (const name of expected) assert.ok(repos[tier].for_each.includes(`"${name}"`), `${tier}/${name}`);
+      assert.equal(repos[tier].name, `${tier}/\${each.value}`);
+    }
   });
 
   test("every repository has immutable tags, so a tag can never move to a new digest", () => {
-    for (const r of repos) assert.equal(r.image_tag_mutability, "IMMUTABLE", r.name);
+    for (const r of Object.values(repos)) assert.equal(r.image_tag_mutability, "IMMUTABLE");
   });
 
   test("every repository has a lifecycle policy that keeps the last N releases", () => {
-    const lps = resources(s, "aws_ecr_lifecycle_policy");
-    assert.equal(lps.length, repos.length);
-    for (const lp of lps) {
-      const rule = JSON.parse(lp.policy).rules[0];
-      assert.equal(rule.selection.countType, "imageCountMoreThan");
-      assert.equal(rule.selection.countNumber, cfg.imagesRetained);
+    const lps = byName(s, "aws_ecr_lifecycle_policy");
+    for (const tier of ["internal", "release"]) {
+      assert.equal(lps[tier].for_each, `\${aws_ecr_repository.${tier}}`);
+      assert.match(lps[tier].policy, /^\$\{jsonencode\(/);
+      assert.ok(lps[tier].policy.includes(`"countNumber" = ${cfg.imagesRetained}`));
+      assert.ok(lps[tier].policy.includes(`"countType" = "imageCountMoreThan"`));
     }
   });
 
   test("internal repos are readable by workload accounts only; release repos by customers only", () => {
-    const rps = resources(s, "aws_ecr_repository_policy");
-    assert.equal(rps.length, repos.length);
-    const workloadRoots = workloads.map((w) => `arn:aws:iam::${w.accountId}:root`).sort();
-    const customerRoots = cfg.customerAccountIds.map((a) => `arn:aws:iam::${a}:root`).sort();
-    for (const rp of rps) {
-      const stmt = policy(rp.policy).Statement;
-      assert.equal(stmt.length, 1);
-      const principals = asArray<string>(stmt[0].Principal.AWS).sort();
-      assert.ok(!principals.includes("*"), "no public pull");
-      assert.deepEqual(stmt[0].Action.sort(), ["ecr:BatchCheckLayerAvailability", "ecr:BatchGetImage", "ecr:GetDownloadUrlForLayer"]);
-      if (rp.repository.includes("ecr_repository.internal")) assert.deepEqual(principals, workloadRoots);
-      else assert.deepEqual(principals, customerRoots);
+    const rps = byName(s, "aws_ecr_repository_policy");
+    const expectPrincipals = {
+      internal: workloads.map((w) => `arn:aws:iam::${w.accountId}:root`),
+      release: cfg.customerAccountIds.map((a) => `arn:aws:iam::${a}:root`),
+    };
+    for (const tier of ["internal", "release"] as const) {
+      assert.equal(rps[tier].for_each, `\${aws_ecr_repository.${tier}}`);
+      const [st] = statements(s, rps[tier].policy);
+      const p = asArray<any>(st.principals)[0];
+      assert.equal(p.type, "AWS");
+      assert.deepEqual(p.identifiers.sort(), expectPrincipals[tier].sort());
+      assert.ok(!p.identifiers.includes("*"), "no public pull");
+      assert.deepEqual(st.actions.sort(), ["ecr:BatchCheckLayerAvailability", "ecr:BatchGetImage", "ecr:GetDownloadUrlForLayer"]);
     }
+  });
+
+  test("with no customers yet, release repos get no pull policy (an empty principal list is invalid)", () => {
+    assert.deepEqual(Object.keys(byName(noCustomers, "aws_ecr_repository_policy")), ["internal"]);
   });
 });
 
 describe("GHES OIDC and promotion roles [DEP-04]", () => {
-  const ghesHost = new URL(cfg.ghes.url).host;
+  const issuer = `${new URL(cfg.ghes.url).host}/_services/token`;
 
   test("GHES is an OIDC provider for STS", () => {
     const p = one(s, "aws_iam_openid_connect_provider");
@@ -60,31 +68,35 @@ describe("GHES OIDC and promotion roles [DEP-04]", () => {
     assert.deepEqual(p.client_id_list, ["sts.amazonaws.com"]);
   });
 
-  const ghesRoles = roles.filter((r) => JSON.stringify(policy(r.assume_role_policy)).includes("_services/token"));
-
   test("two promotion roles: internal (dev/nonprod/prod) and GA (customer release)", () => {
-    assert.deepEqual(ghesRoles.map((r) => r.name).sort(), ["ghes-promote-internal", "ghes-publish-ga"]);
+    assert.equal(roles.ghes_promote_internal.name, "ghes-promote-internal");
+    assert.equal(roles.ghes_publish_ga.name, "ghes-publish-ga");
   });
 
-  test("trust is pinned to the app repo and a GHES Environment, never a wildcard repo", () => {
-    for (const r of ghesRoles) {
-      const st = policy(r.assume_role_policy).Statement[0];
-      assert.equal(st.Action, "sts:AssumeRoleWithWebIdentity");
-      assert.equal(st.Condition.StringEquals[`${ghesHost}/_services/token:aud`], "sts.amazonaws.com");
-      const subs = asArray<string>(st.Condition.StringEquals[`${ghesHost}/_services/token:sub`]);
-      assert.ok(subs.length > 0);
-      for (const sub of subs) assert.match(sub, new RegExp(`^repo:${cfg.ghes.appRepository}:environment:[a-z]+$`));
-      assert.equal(st.Condition.StringLike, undefined, "no wildcard subjects");
+  test("trust is pinned to the app repo and a GHES Environment, never a wildcard", () => {
+    for (const [name, envs] of [
+      ["ghes_promote_internal", workloads.map((w) => w.name)],
+      ["ghes_publish_ga", ["ga"]],
+    ] as const) {
+      const [st] = statements(s, roles[name].assume_role_policy);
+      assert.deepEqual(st.actions, ["sts:AssumeRoleWithWebIdentity"]);
+      assert.deepEqual(condition(st, "StringEquals", `${issuer}:aud`), ["sts.amazonaws.com"]);
+      assert.deepEqual(condition(st, "StringEquals", `${issuer}:sub`), envs.map((e) => `repo:${cfg.ghes.appRepository}:environment:${e}`));
+      assert.ok(!asArray<any>(st.condition).some((c) => c.test === "StringLike"), "no wildcard subjects");
     }
-    const ga = ghesRoles.find((r) => r.name === "ghes-publish-ga")!;
-    const gaSubs = policy(ga.assume_role_policy).Statement[0].Condition.StringEquals[`${ghesHost}/_services/token:sub`];
-    assert.deepEqual(asArray(gaSubs), [`repo:${cfg.ghes.appRepository}:environment:ga`]);
+  });
+
+  test("internal role pushes to internal/* only; GA role to release/* only", () => {
+    const pushes = byName(s, "aws_iam_role_policy");
+    const scope = (name: string) => statements(s, pushes[name].policy).find((x) => x.actions.includes("ecr:PutImage")).resources;
+    assert.deepEqual(scope("ghes_promote_internal"), [`arn:aws:ecr:${cfg.region}:${cfg.accountId}:repository/internal/*`]);
+    assert.deepEqual(scope("ghes_publish_ga"), [`arn:aws:ecr:${cfg.region}:${cfg.accountId}:repository/release/*`]);
   });
 });
 
 describe("Managed Argo CD on a zero-pod hub cluster [DEP-03] [DEP-07] [OPS-03]", () => {
   test("one private hub cluster with access entries and no self-managed add-ons", () => {
-    const c = one(s, "aws_eks_cluster");
+    const c = byName(s, "aws_eks_cluster").delivery_hub;
     assert.equal(c.name, "delivery-hub");
     assert.equal(c.vpc_config.endpoint_public_access, false);
     assert.equal(c.vpc_config.endpoint_private_access, true);
@@ -99,37 +111,35 @@ describe("Managed Argo CD on a zero-pod hub cluster [DEP-03] [DEP-07] [OPS-03]",
   });
 
   test("the Argo CD capability is managed, retains Applications on delete, and uses Identity Center", () => {
-    const cap = one(s, "aws_eks_capability");
+    const cap = byName(s, "aws_eks_capability").argocd;
     assert.equal(cap.type, "ARGOCD");
     assert.equal(cap.capability_name, "argocd");
     assert.equal(cap.delete_propagation_policy, "RETAIN");
-    const argo = asArray<any>(cap.configuration)[0].argo_cd[0] ?? asArray<any>(cap.configuration)[0].argo_cd;
+    const argo = asArray<any>(asArray<any>(cap.configuration)[0].argo_cd)[0];
     assert.equal(argo.namespace, "argocd");
     assert.equal(asArray<any>(argo.aws_idc)[0].idc_instance_arn, cfg.identityCenter.instanceArn);
-    const mappings = asArray<any>(argo.rbac_role_mapping);
-    const byRole = Object.fromEntries(mappings.map((m) => [m.role, asArray<any>(m.identity).map((i) => [i.type, i.id])]));
+    const byRole = Object.fromEntries(asArray<any>(argo.rbac_role_mapping).map((m) => [m.role, asArray<any>(m.identity).map((i) => [i.type, i.id])]));
     assert.deepEqual(byRole.ADMIN, [["SSO_GROUP", cfg.identityCenter.argocdAdminGroupId]]);
     assert.deepEqual(byRole.VIEWER, [["SSO_GROUP", cfg.identityCenter.argocdViewerGroupId]]);
   });
 
   test("the capability role is assumable only by EKS capabilities, with a deterministic name", () => {
-    const role = roles.find((r) => r.name === "eks-capability-argocd")!;
-    assert.ok(role);
-    const st = policy(role.assume_role_policy).Statement[0];
-    assert.equal(st.Principal.Service, "capabilities.eks.amazonaws.com");
-    assert.deepEqual(st.Action.sort(), ["sts:AssumeRole", "sts:TagSession"]);
+    const role = roles.argocd_capability;
+    assert.equal(role.name, "eks-capability-argocd");
+    const [st] = statements(s, role.assume_role_policy);
+    assert.deepEqual(asArray<any>(st.principals)[0], { type: "Service", identifiers: ["capabilities.eks.amazonaws.com"] });
+    assert.deepEqual(st.actions.sort(), ["sts:AssumeRole", "sts:TagSession"]);
   });
 
   test("the capability role can read the deploy repo connection and internal/ charts only", () => {
-    const inline = resources(s, "aws_iam_role_policy").filter((p) => p.name === "argocd-sources");
-    assert.equal(inline.length, 1);
-    const stmts = policy(inline[0].policy).Statement;
-    const actions = stmts.flatMap((x: any) => x.Action);
+    const stmts = statements(s, byName(s, "aws_iam_role_policy").argocd_sources.policy);
+    const actions = stmts.flatMap((x) => x.actions);
     assert.ok(actions.includes("codeconnections:UseConnection"));
-    assert.ok(actions.includes("ecr:BatchGetImage"));
     assert.ok(!actions.some((a: string) => a.endsWith(":*") || a === "*"), "no wildcard actions");
-    const ecrStmt = stmts.find((x: any) => x.Action.includes("ecr:BatchGetImage"));
-    for (const r of asArray<string>(ecrStmt.Resource)) assert.match(r, /aws_ecr_repository\.internal-/);
+    const ecr = stmts.find((x) => x.actions.includes("ecr:BatchGetImage"));
+    assert.deepEqual(ecr.resources, [`arn:aws:ecr:${cfg.region}:${cfg.accountId}:repository/internal/*`]);
+    const cc = stmts.find((x) => x.actions.includes("codeconnections:UseConnection"));
+    assert.deepEqual(cc.resources, ["${aws_codeconnections_connection.deploy_repo.arn}"]);
   });
 });
 
@@ -144,17 +154,15 @@ describe("CodeConnections host for the private GHES", () => {
   });
 
   test("the host's security group can only reach GHES on 443", () => {
-    const egress = resources(s, "aws_vpc_security_group_egress_rule");
-    assert.equal(egress.length, 1);
-    assert.equal(egress[0].cidr_ipv4, cfg.ghes.cidr);
-    assert.equal(egress[0].from_port, 443);
-    assert.equal(egress[0].to_port, 443);
+    const egress = one(s, "aws_vpc_security_group_egress_rule");
+    assert.equal(egress.cidr_ipv4, cfg.ghes.cidr);
+    assert.equal(egress.from_port, 443);
+    assert.equal(egress.to_port, 443);
     assert.equal(resources(s, "aws_vpc_security_group_ingress_rule").length, 0);
   });
 
   test("one connection on that host", () => {
-    const c = one(s, "aws_codeconnections_connection");
-    assert.match(c.host_arn, /aws_codeconnections_host\./);
+    assert.equal(one(s, "aws_codeconnections_connection").host_arn, "${aws_codeconnections_host.ghes.arn}");
   });
 });
 

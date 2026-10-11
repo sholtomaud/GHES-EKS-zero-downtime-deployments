@@ -3,3 +3,4 @@ cdktn.out/
 .terraform/
 *.tfstate*
 coverage/
+.tofu-plugin-cache/
