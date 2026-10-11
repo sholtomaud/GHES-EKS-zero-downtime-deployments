@@ -1,0 +1,12 @@
+# Platform pieces in ONE environment, as a Helm chart: the AWS Load Balancer
+# Controller (subchart, from an Artifactory remote of aws/eks-charts) and the
+# Fargate log router ConfigMap. Packaged and shipped like app-env.
+apiVersion: v2
+name: platform-env # x-bundle-name
+description: Platform components in one environment (generated)
+type: application
+version: 0.0.0 # x-bundle-version
+dependencies:
+  - name: aws-load-balancer-controller
+    version: 1.17.1 # controller v2.17.1, matching infra/src/policies
+    repository: https://ARTIFACTORY_EKS_CHARTS_REMOTE # x-eks-charts-repository

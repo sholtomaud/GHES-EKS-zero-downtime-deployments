@@ -41,7 +41,9 @@ RUN npm install -g "cdktn-cli@${CDKTN_CLI_VERSION}" "typescript@${TYPESCRIPT_VER
  && npm cache clean --force \
  && cdktn --version && tsgo --version
 
-# cdktn drives OpenTofu, never Terraform. No telemetry calls.
+# cdktn drives OpenTofu, never Terraform. The Makefile points it at
+# infra/scripts/tofu-cdktn (mounted from the repo); plain tofu is the fallback.
+# No telemetry calls.
 ENV TERRAFORM_BINARY_NAME=tofu \
     CHECKPOINT_DISABLE=1 \
     HOME=/tmp \

@@ -1,0 +1,54 @@
+# Cluster registrations on the delivery hub. Applied once (and when an
+# environment is added) from a GHES runner in the tooling VPC:
+#   kubectl --context delivery-hub apply -f deploy/bootstrap/
+# The managed Argo CD reaches every cluster by EKS ARN through access entries
+# (infra: argocd.tf, access.tf); no network path, no kubeconfig.
+# (verify) cluster Secret shape for the EKS capability.
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: delivery-hub
+  namespace: argocd
+  labels:
+    argocd.argoproj.io/secret-type: cluster
+stringData:
+  name: delivery-hub
+  server: arn:aws:eks:ap-southeast-2:111111111111:cluster/delivery-hub
+  project: default
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: app-dev
+  namespace: argocd
+  labels:
+    argocd.argoproj.io/secret-type: cluster
+stringData:
+  name: app-dev
+  server: arn:aws:eks:ap-southeast-2:222222222222:cluster/app-dev
+  project: default
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: app-nonprod
+  namespace: argocd
+  labels:
+    argocd.argoproj.io/secret-type: cluster
+stringData:
+  name: app-nonprod
+  server: arn:aws:eks:ap-southeast-2:333333333333:cluster/app-nonprod
+  project: default
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: app-prod
+  namespace: argocd
+  labels:
+    argocd.argoproj.io/secret-type: cluster
+stringData:
+  name: app-prod
+  server: arn:aws:eks:ap-southeast-2:444444444444:cluster/app-prod
+  project: default

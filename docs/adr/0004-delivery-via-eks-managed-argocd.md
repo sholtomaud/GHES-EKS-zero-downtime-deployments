@@ -11,7 +11,9 @@
 The owner now requires AWS managed Argo CD and AWS-managed DevOps/GitOps
 wherever possible. The EKS Capability for Argo CD runs in AWS-owned
 infrastructure, so it costs 0 pods and 0 workload-VPC IPs. It reaches private
-clusters by EKS access entry, and private Git through CodeConnections.
+clusters by EKS access entry. It has no route into our VPC, so it can read
+neither the private GHES nor the private Artifactory; its private sources are
+ECR, CodeCommit and CodeConnections.
 Customers don't use any of this (ADR-0007).
 
 ## Options considered
@@ -29,11 +31,15 @@ simpler, corrects drift continuously, and is the only option that meets O1/O2.
 
 ## Decision
 
-Use **option A**. The managed Argo CD reads the deploy repo on GHES through a
-CodeConnections host in the tooling VPC. It pulls the chart from ECR
-`internal/*` by IAM, and deploys to Fargate-only workload clusters through
-access entries. A promotion is one commit from the GHES promote workflow, made
-after a GHES Environment approval.
+Use **option A**. The managed Argo CD has **no Git source**. Each
+environment's desired state is a Helm bundle (`deploy/`): the customer chart,
+vendored unchanged, plus that environment's values. After a GHES Environment
+approval, the promote workflow packages the bundle, stores it in Artifactory
+with build-info (system of record), and copies it by digest to the **private
+ECR** under `internal/deploy/`. Argo CD reads only that private ECR copy, by
+IAM, tracking the highest bundle version, and deploys to Fargate-only workload
+clusters through access entries. GHES and Artifactory stay private, so
+CodeConnections isn't needed (owner decision, 2026-10-11).
 
 ## Consequences
 
@@ -42,9 +48,11 @@ after a GHES Environment approval.
   scripts to own.
 - Negative / costs: a `delivery-hub` EKS control plane (~US$73/month) plus
   capability charges *(rates to verify)*. The hub's role is admin on every
-  workload cluster. Argo CD renders with `helm template`, not `helm upgrade`
+  workload cluster. Env-value history lives in Git, but the deployed-state
+  history lives in Artifactory builds and ECR tags, not in a deploy repo.
+  Argo CD renders with `helm template`, not `helm upgrade`
   (design.md §5.3). There's no automatic metric rollback until the slice-3 gate.
-- Follow-ups: verify V1–V5 (design.md §11). Build the post-sync metric gate
+- Follow-ups: verify V1, V3–V5 and V11 (design.md §11). Build the post-sync metric gate
   (Q29). Narrow the hub's access policies.
 
 ## Verification

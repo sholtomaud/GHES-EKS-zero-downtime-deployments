@@ -1,4 +1,4 @@
-import { Fn, ref, S3Backend, TerraformDataSource, TerraformElement, TerraformStack } from "cdktn";
+import { Fn, NamedRemoteWorkspace, ref, RemoteBackend, TerraformDataSource, TerraformElement, TerraformStack } from "cdktn";
 import { Construct } from "constructs";
 import type { Node } from "constructs";
 import { AwsProvider } from "@cdktn/provider-aws/lib/provider/index.js";
@@ -24,7 +24,7 @@ export interface BaseProps {
 export class Group extends Construct {}
 
 /**
- * Every stack: one account, S3 state with native locking, default tags,
+ * Every stack: one account, state in Artifactory, default tags,
  * OpenTofu >= 1.13, and Terraform-style resource names.
  *
  * Naming: a resource's name is its construct id in snake_case, with no hash
@@ -41,12 +41,12 @@ export class BaseStack extends TerraformStack {
   constructor(scope: Construct, id: string, props: BaseProps) {
     super(scope, id);
 
-    new S3Backend(this, {
-      bucket: props.state.bucket,
-      key: `${id}/terraform.tfstate`,
-      region: props.state.region,
-      encrypt: true,
-      useLockfile: true,
+    // State in Artifactory's Terraform Backend repository, one workspace per
+    // stack. No token here: `tofu login <hostname>` or TF_TOKEN_<host>.
+    new RemoteBackend(this, {
+      hostname: props.state.hostname,
+      organization: props.state.repository,
+      workspaces: new NamedRemoteWorkspace(id),
     });
 
     new AwsProvider(this, "aws", {

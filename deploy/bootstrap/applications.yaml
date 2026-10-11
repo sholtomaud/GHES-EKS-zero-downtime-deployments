@@ -1,0 +1,150 @@
+# One Application per environment and component, all reading Helm bundles
+# from ECR internal/deploy/* with the capability role (no Git, no Repository
+# secret). targetRevision "*" = the highest bundle version; every promotion
+# pushes a strictly higher one (1.0.<unix time>), so Argo CD picks it up.
+# (verify V11) "*" resolution for OCI Helm sources on the managed capability.
+# Fallback: the promote job pins targetRevision here from a tooling-VPC runner.
+---
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: app-dev
+  namespace: argocd
+spec:
+  project: default
+  source:
+    repoURL: 111111111111.dkr.ecr.ap-southeast-2.amazonaws.com/internal/deploy
+    chart: app-dev
+    targetRevision: "*"
+  destination:
+    name: app-dev
+    namespace: app
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true # drift is corrected, not just detected [OPS-03]
+    syncOptions:
+      - CreateNamespace=true
+    retry:
+      limit: 3
+      backoff: { duration: 30s, factor: 2, maxDuration: 5m }
+---
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: platform-dev
+  namespace: argocd
+spec:
+  project: default
+  source:
+    repoURL: 111111111111.dkr.ecr.ap-southeast-2.amazonaws.com/internal/deploy
+    chart: platform-dev
+    targetRevision: "*"
+  destination:
+    name: app-dev
+    namespace: kube-system
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true # drift is corrected, not just detected [OPS-03]
+    syncOptions:
+      - CreateNamespace=true
+    retry:
+      limit: 3
+      backoff: { duration: 30s, factor: 2, maxDuration: 5m }
+---
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: app-nonprod
+  namespace: argocd
+spec:
+  project: default
+  source:
+    repoURL: 111111111111.dkr.ecr.ap-southeast-2.amazonaws.com/internal/deploy
+    chart: app-nonprod
+    targetRevision: "*"
+  destination:
+    name: app-nonprod
+    namespace: app
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true # drift is corrected, not just detected [OPS-03]
+    syncOptions:
+      - CreateNamespace=true
+    retry:
+      limit: 3
+      backoff: { duration: 30s, factor: 2, maxDuration: 5m }
+---
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: platform-nonprod
+  namespace: argocd
+spec:
+  project: default
+  source:
+    repoURL: 111111111111.dkr.ecr.ap-southeast-2.amazonaws.com/internal/deploy
+    chart: platform-nonprod
+    targetRevision: "*"
+  destination:
+    name: app-nonprod
+    namespace: kube-system
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true # drift is corrected, not just detected [OPS-03]
+    syncOptions:
+      - CreateNamespace=true
+    retry:
+      limit: 3
+      backoff: { duration: 30s, factor: 2, maxDuration: 5m }
+---
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: app-prod
+  namespace: argocd
+spec:
+  project: default
+  source:
+    repoURL: 111111111111.dkr.ecr.ap-southeast-2.amazonaws.com/internal/deploy
+    chart: app-prod
+    targetRevision: "*"
+  destination:
+    name: app-prod
+    namespace: app
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true # drift is corrected, not just detected [OPS-03]
+    syncOptions:
+      - CreateNamespace=true
+    retry:
+      limit: 3
+      backoff: { duration: 30s, factor: 2, maxDuration: 5m }
+---
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: platform-prod
+  namespace: argocd
+spec:
+  project: default
+  source:
+    repoURL: 111111111111.dkr.ecr.ap-southeast-2.amazonaws.com/internal/deploy
+    chart: platform-prod
+    targetRevision: "*"
+  destination:
+    name: app-prod
+    namespace: kube-system
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true # drift is corrected, not just detected [OPS-03]
+    syncOptions:
+      - CreateNamespace=true
+    retry:
+      limit: 3
+      backoff: { duration: 30s, factor: 2, maxDuration: 5m }

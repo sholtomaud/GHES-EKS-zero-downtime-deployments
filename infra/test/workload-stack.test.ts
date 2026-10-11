@@ -151,12 +151,13 @@ describe("TLS [ENV-04]", () => {
 });
 
 describe("state and tagging", () => {
-  test("S3 backend in the workload account's own bucket, encrypted, native lockfile", () => {
-    const b = s.terraform!.backend.s3;
-    assert.equal(b.bucket, dev.state.bucket);
-    assert.equal(b.key, "workload-dev/terraform.tfstate");
-    assert.equal(b.encrypt, true);
-    assert.equal(b.use_lockfile, true);
+  test("state lives in Artifactory's Terraform backend repository, in this stack's own workspace", () => {
+    assert.deepEqual(Object.keys(s.terraform!.backend), ["remote"]);
+    const b = s.terraform!.backend.remote;
+    assert.equal(b.hostname, dev.state.hostname);
+    assert.equal(b.organization, dev.state.repository);
+    assert.deepEqual(b.workspaces, { name: "workload-dev" });
+    assert.equal(b.token, undefined);
   });
 
   test("provider is pinned to the workload account and tags everything", () => {

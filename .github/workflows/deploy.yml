@@ -1,0 +1,34 @@
+# Tests for the desired-state bundles (deploy/package.sh): packages an app and
+# a platform bundle with real Helm and checks what Argo CD would deploy.
+name: deploy
+
+on:
+  push:
+    paths:
+      - "deploy/**"
+      - ".github/workflows/deploy.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: deploy-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  bundles:
+    runs-on: ${{ vars.RUNNER_LABEL || 'ubuntu-24.04' }}
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
+        with:
+          version: v4.3.0 # same as app-release/app-promote
+
+      - name: Bundle tests
+        # On GHES, point EKS_CHARTS_REPO at the Artifactory remote of aws/eks-charts.
+        env:
+          EKS_CHARTS_REPO: ${{ vars.EKS_CHARTS_REPO || 'https://aws.github.io/eks-charts' }}
+        run: bash deploy/test.sh

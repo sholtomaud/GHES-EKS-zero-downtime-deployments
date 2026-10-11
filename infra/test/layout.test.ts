@@ -8,7 +8,7 @@ import { ToolingStack } from "../src/stacks/tooling-stack.ts";
 import { WorkloadStack } from "../src/stacks/workload-stack.ts";
 import { tooling, workloads } from "../src/config.ts";
 
-const toolingStack = new ToolingStack(Testing.app(), "tooling", { tooling: { ...tooling, customerAccountIds: ["555555555555"] }, workloads });
+const toolingStack = new ToolingStack(Testing.app(), "tooling", { tooling, workloads });
 const workloadStack = new WorkloadStack(Testing.app(), "workload-dev", {
   env: { ...workloads[0], tls: { domainName: "dev.example.com", hostedZoneId: "Z1" } },
   tooling,
@@ -21,7 +21,7 @@ describe("file structure", () => {
   test("tooling: standard files first, then one file per concern", () => {
     assert.deepEqual(
       stacks.tooling.map((f) => f.path),
-      ["terraform.tf", "backend.tf", "providers.tf", "ecr.tf", "ghes_oidc.tf", "codeconnections.tf", "delivery_hub.tf", "argocd.tf"],
+      ["terraform.tf", "backend.tf", "providers.tf", "ghes_oidc.tf", "delivery_hub.tf", "argocd.tf"],
     );
   });
 
@@ -73,11 +73,12 @@ describe("terraform.tf and backend.tf", () => {
     assert.doesNotMatch(tf, /backend/);
   });
 
-  test("backend.tf holds only the S3 backend", () => {
+  test("backend.tf holds only the Artifactory remote backend, with workspaces as a block", () => {
     const b = file(stacks.workload, "backend.tf");
-    assert.match(b, /backend "s3" \{/);
-    assert.match(b, /use_lockfile = true/);
-    assert.doesNotMatch(b, /required_/);
+    assert.match(b, /backend "remote" \{/);
+    assert.match(b, /organization = "[^"]+"/);
+    assert.match(b, /workspaces \{\n\s+name = "workload-dev"\n\s+\}/);
+    assert.doesNotMatch(b, /required_|token/);
   });
 });
 

@@ -50,7 +50,7 @@ See [ADR-0001](docs/adr/0001-fixed-constraints.md).
 | [docs/proposal/local-development.md](docs/proposal/local-development.md) | Proposed local development workflow (Windows/WSL, Podman, VS Code, dev vs clean DB). |
 | [docs/proposal/design.md](docs/proposal/design.md) | **Design v6:** EKS managed Argo CD, Fargate, ECR distribution, cheap logging, cdktn IaC (ADR-0004..0007). |
 | [infra/](infra/README.md) | CDK Terrain (cdktn) stacks → OpenTofu ≥ 1.13 root modules, test-first. `make ci`. |
-| [gitops/](gitops/README.md) | Template for the GHES deploy repo that managed Argo CD reads. |
+| [deploy/](deploy/README.md) | Per-environment desired state as Helm bundles: stored in Artifactory, copied to private ECR, read by managed Argo CD. |
 | [.github/workflows/](.github/workflows/) | `infra.yml` (IaC CI), `app-release.yml` (Sonar, JFrog build-info, Xray), `app-promote.yml` (Artifactory → ECR → deploy repo). |
 | [docs/adr/](docs/adr/) | Architecture Decision Records: accepted and proposed decisions. |
 | [scripts/inventory-ip-usage.sh](scripts/inventory-ip-usage.sh) | Phase 0 tool: break down IP consumption in an existing VPC/cluster. |

@@ -1,6 +1,6 @@
 # Fargate's built-in Fluent Bit log router: no sidecars, no DaemonSets, 0 IPs.
-# Ships container stdout to the pre-created log group (infra: logging.tf,
-# 30-day retention). Pods started before this exists need a restart.
+# Ships container stdout to the pre-created log group (infra: logging.tf).
+# Pods started before this exists need a restart to ship logs.
 apiVersion: v1
 kind: Namespace
 metadata:
@@ -32,7 +32,7 @@ data:
     [OUTPUT]
         Name              cloudwatch_logs
         Match             kube.*
-        region            ap-southeast-2
-        log_group_name    /aws/eks/app-prod/containers
+        region            {{ required "logging.region" .Values.logging.region }}
+        log_group_name    {{ required "logging.logGroupName" .Values.logging.logGroupName }}
         log_stream_prefix fargate-
         auto_create_group false

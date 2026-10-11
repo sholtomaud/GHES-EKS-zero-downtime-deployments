@@ -27,10 +27,11 @@ answer changes, so prioritise accordingly.
 | Q27 | What are the **laptop / VPN client CIDR ranges** (as distinct from server ranges) for the RDS security-group prefix list? Does the VPN assign stable per-user addresses? | Width of the 5432 rule (local-development.md §5.5). | **Answered:** The VPN is always on, so the source is just the VPN client pool. Take the CIDR from the network team at build time. Stable per-user addresses aren't needed: identity comes from the DB login. |
 | Q28 | Does the **dirty test data on dev RDS** contain real personal or customer data? Where does it come from, and who refreshes it? | If yes, laptops connect to dev with per-person, audited logins (as clean), not the shared DML role (local-development.md §5.4). | **Answered:** No PII, but it holds samples of actual data. The shared DML-only role is fine; the no-copy rule still applies (local-development.md §5.4). Source and refresh owner are still to confirm. |
 | Q29 | Can CI read Argo CD application health from the managed capability's API (token or IAM)? | The post-sync metric gate and auto-revert (design.md §5.2). | _unanswered_ |
-| Q30 | How many free IPs does the **tooling** VPC have, and which subnets may the hub cluster and CodeConnections host use? | ~6 IPs in the tooling VPC (design.md §6). | _unanswered_ |
+| Q30 | How many free IPs does the **tooling** VPC have, and which subnets may the hub cluster use? | ~6 IPs in the tooling VPC (design.md §6). | _unanswered_ |
 | Q31 | Is there an IAM Identity Center instance we can use for Argo CD SSO, and which groups are Argo CD admins and viewers? | Required by the capability (design.md V4). | _unanswered_ |
 | Q32 | Do all customers have AWS accounts to pull from ECR, or do some need another route (IAM user, mirror)? | ADR-0007. | _unanswered_ |
 | Q33 | Which Artifactory repos (Docker, Helm OCI, generic) and Xray watches already exist, and is a JFrog OIDC integration for GHES allowed? | Workflow variables; OIDC vs tokens. | _unanswered_ |
+| Q34 | Which account and region hold the existing ECR, and does its owner keep tags immutable, keep ≥ 10 releases, and allow cross-account pull for our workload accounts and the Argo CD capability role? It also needs repositories `internal/deploy/app-<env>` and `internal/deploy/platform-<env>` for the env bundles. | Fargate and Argo CD pulls; rollback without Artifactory (design.md §8). Config: `infra/src/config.ts` `ecr`. | _unanswered_ |
 
 ## Medium impact
 

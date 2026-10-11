@@ -1,0 +1,16 @@
+# Desired state of the application in ONE environment, as a Helm chart.
+# The promote workflow fills in the placeholders, vendors the customer chart
+# (helm dependency build), packages it as app-<env>:<bundle version>, stores it
+# in Artifactory and copies it to ECR, where managed Argo CD reads it.
+# The subchart is the customer chart, byte for byte [DEP-01]; this wrapper
+# only adds this environment's values (values.yaml, from environments/<env>/).
+apiVersion: v2
+name: app-env # x-bundle-name
+description: Desired state of the application in one environment (generated)
+type: application
+version: 0.0.0 # x-bundle-version
+appVersion: "0.0.0" # x-app-version
+dependencies:
+  - name: app
+    version: "0.0.0" # x-app-version
+    repository: oci://ARTIFACTORY_HELM_REPO # x-app-repository

@@ -5,10 +5,30 @@ export type EnvironmentName = "dev" | "nonprod" | "prod";
 export type InstallProfile = "minimal" | "standard" | "ha";
 export type LogClass = "STANDARD" | "INFREQUENT_ACCESS";
 
-/** Remote state: one S3 bucket per account, native S3 locking (no DynamoDB). */
+/**
+ * Remote state in Artifactory's Terraform Backend repository (`remote` backend
+ * protocol, with locking and state history). One workspace per stack. The token
+ * is never in config: `tofu login <hostname>` locally, TF_TOKEN_<host> in CI.
+ */
 export interface StateConfig {
-  bucket: string;
+  /** JFrog Platform domain, e.g. artifactory.example.internal */
+  hostname: string;
+  /** Key of the Terraform Backend repository in Artifactory. */
+  repository: string;
+}
+
+/**
+ * The ECR that already exists (owned outside this repo). We only grant access
+ * to it. Its owner keeps tags immutable, lifecycle rules and the cross-account
+ * pull policy for the workload and customer accounts (design.md §8).
+ */
+export interface EcrConfig {
+  accountId: string;
   region: string;
+  /** Prefix for releases our environments run, e.g. internal/<service>. */
+  internalPrefix: string;
+  /** Prefix for GA releases customers pull, e.g. release/<service>. */
+  releasePrefix: string;
 }
 
 export interface ToolingConfig {
@@ -22,14 +42,8 @@ export interface ToolingConfig {
   ghes: {
     /** e.g. https://ghes.example.internal */
     url: string;
-    /** CIDR of the GHES instance, the only egress target of the CodeConnections host. */
-    cidr: string;
-    /** PEM of the CA that signed the GHES certificate, if private. */
-    tlsCertificate?: string;
     /** owner/repo of the application repo whose promote workflow pushes to ECR. */
     appRepository: string;
-    /** owner/repo of the GitOps deploy repo that Argo CD reads. */
-    deployRepository: string;
   };
   identityCenter: {
     instanceArn: string;
@@ -37,14 +51,7 @@ export interface ToolingConfig {
     argocdAdminGroupId: string;
     argocdViewerGroupId: string;
   };
-  /** The 8 application images. Each gets internal/<name> and release/<name>. */
-  services: string[];
-  /** Helm chart repository name (OCI), e.g. "app". */
-  chartName: string;
-  /** Releases kept in ECR so rollback never needs Artifactory. */
-  imagesRetained: number;
-  /** Customer AWS accounts allowed to pull GA releases (release/*). */
-  customerAccountIds: string[];
+  ecr: EcrConfig;
 }
 
 export interface WorkloadConfig {
@@ -95,19 +102,18 @@ export function argocdCapabilityRoleArn(tooling: Pick<ToolingConfig, "accountId"
 const region = "ap-southeast-2";
 // (verify) pick a version in EKS standard support at build time [OPS-02].
 const kubernetesVersion = "1.35";
+const state: StateConfig = { hostname: "artifactory.example.internal", repository: "tofu-state" };
 
 export const tooling: ToolingConfig = {
   accountId: "111111111111",
   region,
-  state: { bucket: "tfstate-111111111111", region },
+  state,
   vpcId: "vpc-0tooling00000000",
   privateSubnetIds: ["subnet-0toolinga0000000", "subnet-0toolingb0000000"],
   kubernetesVersion,
   ghes: {
     url: "https://ghes.example.internal",
-    cidr: "10.10.0.10/32",
     appRepository: "platform/app",
-    deployRepository: "platform/app-deploy",
   },
   identityCenter: {
     instanceArn: "arn:aws:sso:::instance/ssoins-0000000000000000",
@@ -115,11 +121,7 @@ export const tooling: ToolingConfig = {
     argocdAdminGroupId: "00000000-0000-0000-0000-000000000001",
     argocdViewerGroupId: "00000000-0000-0000-0000-000000000002",
   },
-  // Only api, agent and frontend are named in the docs; the other five are PLACEHOLDERS.
-  services: ["api", "agent", "frontend", "service-4", "service-5", "service-6", "service-7", "service-8"],
-  chartName: "app",
-  imagesRetained: 30,
-  customerAccountIds: [],
+  ecr: { accountId: "111111111111", region, internalPrefix: "internal", releasePrefix: "release" },
 };
 
 function workload(
@@ -132,7 +134,7 @@ function workload(
     name,
     accountId,
     region,
-    state: { bucket: `tfstate-${accountId}`, region },
+    state,
     profile,
     vpcId: `vpc-0${name}0000000000`,
     privateSubnetIds: [`subnet-0${name}a000000`, `subnet-0${name}b000000`],

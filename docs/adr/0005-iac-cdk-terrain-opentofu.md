@@ -25,9 +25,14 @@ The synthesised output must look like a hand-written root module, not one
 ## Decision
 
 1. `infra/` is a cdktn TypeScript app. There is **one stack per AWS account**
-   (`tooling`, `workload-<env>`), each with its own S3 state and native lockfile.
+   (`tooling`, `workload-<env>`). State lives in **Artifactory's Terraform
+   Backend repository** (`backend "remote"`), one workspace per stack, with
+   built-in locking and history. The token comes from `tofu login` or
+   `TF_TOKEN_<host>`, never from config.
 2. Every stack declares `required_version >= 1.13.0`. `cdktf.json` targets
    `opentofu >= 1.13.0`, so cdktn's feature validations apply.
+   ECR already exists and is not created here; IAM grants are scoped to its
+   `internal/` and `release/` prefixes (config `ecr`).
 3. `cdktn synth` also writes conventional root modules to
    `cdktn.out/tofu/<stack>/` (`terraform.tf`, `backend.tf`, `providers.tf`,
    `locals.tf`, one `<concern>.tf` per construct group, `policies/*.json`),
@@ -53,10 +58,11 @@ The synthesised output must look like a hand-written root module, not one
 ## Verification
 
 `make ci` is green locally and in `.github/workflows/infra.yml`: typecheck,
-69 tests, synth, and `tofu validate` for all 4 stacks on OpenTofu 1.13.1.
+66 tests, synth, and `tofu validate` for all 4 stacks on OpenTofu 1.13.1.
 
 ## References
 
 - cdktn 0.24.0, cdktn-cli 0.24.0, @cdktn/provider-aws 25.7.2 (hashicorp/aws 6.68.0): npm registry, 2026-10-11
 - https://cdktn.io/docs (MCP: https://cdktn.io/docs/mcp)
 - OpenTofu v1.13.1 release: https://github.com/opentofu/opentofu/releases/tag/v1.13.1
+- Artifactory Terraform/OpenTofu backend: https://docs.jfrog.com/artifactory/docs/terraform-opentofu-and-terraform-backend-repositories, https://jfrog.com/help/r/jfrog-artifactory-documentation/configure-terraform-backend-repository-with-artifactory-using-opentofu

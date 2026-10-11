@@ -1,14 +1,13 @@
-// Tooling account: ECR release cache + customer distribution, GHES OIDC trust,
-// and the delivery hub (a zero-pod EKS cluster that hosts the managed Argo CD
-// capability). See docs/proposal/design.md and ADR-0004.
+// Tooling account: GHES OIDC trust (push to the existing ECR) and the delivery
+// hub, a zero-pod EKS cluster that hosts the managed Argo CD capability.
+// See docs/proposal/design.md and ADR-0004.
 //
-// Each Group below synthesises to its own file: ecr.tf, ghes_oidc.tf,
-// codeconnections.tf, delivery_hub.tf, argocd.tf.
-import { Fn, TerraformIterator } from "cdktn";
+// Argo CD has no Git source: it reads charts and per-environment desired-state
+// bundles from ECR with its IAM role, so nothing here needs VPC access.
+//
+// Each Group below synthesises to its own file: ghes_oidc.tf, delivery_hub.tf,
+// argocd.tf.
 import type { Construct } from "constructs";
-import { EcrRepository } from "@cdktn/provider-aws/lib/ecr-repository/index.js";
-import { EcrLifecyclePolicy } from "@cdktn/provider-aws/lib/ecr-lifecycle-policy/index.js";
-import { EcrRepositoryPolicy } from "@cdktn/provider-aws/lib/ecr-repository-policy/index.js";
 import { IamOpenidConnectProvider } from "@cdktn/provider-aws/lib/iam-openid-connect-provider/index.js";
 import { IamRole } from "@cdktn/provider-aws/lib/iam-role/index.js";
 import { IamRolePolicy } from "@cdktn/provider-aws/lib/iam-role-policy/index.js";
@@ -17,10 +16,6 @@ import { EksCluster } from "@cdktn/provider-aws/lib/eks-cluster/index.js";
 import { EksCapability } from "@cdktn/provider-aws/lib/eks-capability/index.js";
 import { EksAccessEntry } from "@cdktn/provider-aws/lib/eks-access-entry/index.js";
 import { EksAccessPolicyAssociation } from "@cdktn/provider-aws/lib/eks-access-policy-association/index.js";
-import { CodeconnectionsHost } from "@cdktn/provider-aws/lib/codeconnections-host/index.js";
-import { CodeconnectionsConnection } from "@cdktn/provider-aws/lib/codeconnections-connection/index.js";
-import { SecurityGroup } from "@cdktn/provider-aws/lib/security-group/index.js";
-import { VpcSecurityGroupEgressRule } from "@cdktn/provider-aws/lib/vpc-security-group-egress-rule/index.js";
 import { BaseStack, Group, iamPolicy } from "./base.ts";
 import { names, type ToolingConfig, type WorkloadConfig } from "../config.ts";
 
@@ -35,55 +30,8 @@ const PUSH_ACTIONS = [...PULL_ACTIONS, "ecr:CompleteLayerUpload", "ecr:InitiateL
 export class ToolingStack extends BaseStack {
   constructor(scope: Construct, id: string, { tooling: t, workloads }: ToolingStackProps) {
     super(scope, id, { accountId: t.accountId, region: t.region, state: t.state, tags: {} });
-    const repoArn = (prefix: string) => `arn:aws:ecr:${t.region}:${t.accountId}:repository/${prefix}/*`;
-
-    // --- ecr.tf: internal/* (our envs) and release/* (GA, customers) -------
-    // Artifactory stays the system of record; GHES copies releases here by digest.
-    const ecr = new Group(this, "ecr");
-    const repoNames = [...t.services, `charts/${t.chartName}`];
-    const tiers = {
-      internal: workloads.map((w) => `arn:aws:iam::${w.accountId}:root`),
-      release: t.customerAccountIds.map((a) => `arn:aws:iam::${a}:root`),
-    };
-    for (const tier of Object.keys(tiers) as (keyof typeof tiers)[]) {
-      const each = TerraformIterator.fromList(repoNames);
-      const repos = new EcrRepository(ecr, tier, {
-        forEach: each,
-        name: `${tier}/${each.value}`,
-        imageTagMutability: "IMMUTABLE",
-        encryptionConfiguration: [{ encryptionType: "AES256" }],
-        // Vulnerability scanning is JFrog Xray's job, before promotion.
-        imageScanningConfiguration: { scanOnPush: false },
-      });
-
-      const repo = TerraformIterator.fromResources(repos);
-      new EcrLifecyclePolicy(ecr, `${tier}:lifecycle`, {
-        forEach: repo,
-        repository: repo.getString("name"),
-        policy: Fn.jsonencode({
-          rules: [
-            {
-              rulePriority: 1,
-              description: `Keep the last ${t.imagesRetained} images so rollback never needs Artifactory`,
-              selection: { tagStatus: "any", countType: "imageCountMoreThan", countNumber: t.imagesRetained },
-              action: { type: "expire" },
-            },
-          ],
-        }),
-      });
-
-      // An empty principal list is invalid IAM: no customers yet means no pull policy.
-      if (tiers[tier].length === 0) continue;
-      const pull = iamPolicy(ecr, `${tier}_pull`, [
-        { sid: "CrossAccountPull", effect: "Allow", actions: PULL_ACTIONS, principals: [{ type: "AWS", identifiers: tiers[tier] }] },
-      ]);
-      const policyRepo = TerraformIterator.fromResources(repos);
-      new EcrRepositoryPolicy(ecr, `${tier}:policy`, {
-        forEach: policyRepo,
-        repository: policyRepo.getString("name"),
-        policy: pull.json,
-      });
-    }
+    // ECR already exists and is owned elsewhere: we only grant access to it.
+    const repoArn = (prefix: string) => `arn:aws:ecr:${t.ecr.region}:${t.ecr.accountId}:repository/${prefix}/*`;
 
     // --- ghes_oidc.tf: the promote workflow pushes by digest -----------------
     const ghes = new Group(this, "ghes_oidc");
@@ -111,35 +59,8 @@ export class ToolingStack extends BaseStack {
       const role = new IamRole(ghes, name, { name: name.replace(/_/g, "-"), maxSessionDuration: 3600, assumeRolePolicy: trust.json });
       new IamRolePolicy(ghes, `${name}:ecr_push`, { name: "ecr-push", role: role.id, policy: push.json });
     };
-    ghesRole("ghes_promote_internal", workloads.map((w) => w.name), "internal");
-    ghesRole("ghes_publish_ga", ["ga"], "release");
-
-    // --- codeconnections.tf: managed Argo CD reaches the private GHES --------
-    const cc = new Group(this, "codeconnections");
-    const sg = new SecurityGroup(cc, "codeconnections", {
-      name: "codeconnections-ghes",
-      description: "CodeConnections host ENIs: HTTPS to GHES only",
-      vpcId: t.vpcId,
-      revokeRulesOnDelete: true,
-    });
-    new VpcSecurityGroupEgressRule(cc, "ghes_https", {
-      securityGroupId: sg.id,
-      ipProtocol: "tcp",
-      fromPort: 443,
-      toPort: 443,
-      cidrIpv4: t.ghes.cidr,
-      description: "GHES HTTPS",
-    });
-    const host = new CodeconnectionsHost(cc, "ghes", {
-      name: "ghes",
-      providerType: "GitHubEnterpriseServer",
-      providerEndpoint: t.ghes.url,
-      vpcConfiguration: [
-        { vpcId: t.vpcId, subnetIds: t.privateSubnetIds, securityGroupIds: [sg.id], tlsCertificate: t.ghes.tlsCertificate },
-      ],
-    });
-    // Created PENDING; a GHES admin completes the handshake once in the console.
-    const connection = new CodeconnectionsConnection(cc, "deploy_repo", { name: "ghes-deploy-repo", hostArn: host.arn });
+    ghesRole("ghes_promote_internal", workloads.map((w) => w.name), t.ecr.internalPrefix);
+    ghesRole("ghes_publish_ga", ["ga"], t.ecr.releasePrefix);
 
     // --- delivery_hub.tf: EKS control plane only, no pods -------------------
     const hubGroup = new Group(this, "delivery_hub");
@@ -178,9 +99,9 @@ export class ToolingStack extends BaseStack {
       },
     ]);
     const sources = iamPolicy(argo, "argocd_sources", [
-      { sid: "DeployRepo", effect: "Allow", actions: ["codeconnections:UseConnection", "codeconnections:GetConnection"], resources: [connection.arn] },
       { sid: "EcrAuth", effect: "Allow", actions: ["ecr:GetAuthorizationToken"], resources: ["*"] },
-      { sid: "InternalCharts", effect: "Allow", actions: PULL_ACTIONS, resources: [repoArn("internal")] },
+      // The app chart and the per-environment desired-state bundles (deploy/*).
+      { sid: "InternalCharts", effect: "Allow", actions: PULL_ACTIONS, resources: [repoArn(t.ecr.internalPrefix)] },
     ]);
     const capabilityRole = new IamRole(argo, "argocd_capability", {
       name: names.argocdCapabilityRole,
