@@ -102,38 +102,27 @@ describe("Managed Argo CD on a zero-pod hub cluster [DEP-03] [DEP-07] [OPS-03]",
     assert.deepEqual(st.actions.sort(), ["sts:AssumeRole", "sts:TagSession"]);
   });
 
-  test("the capability role can read the deploy repo connection and internal/ charts only", () => {
+  test("the capability role reads charts and env bundles from the existing ECR internal/ prefix only", () => {
     const stmts = statements(s, byName(s, "aws_iam_role_policy").argocd_sources.policy);
     const actions = stmts.flatMap((x) => x.actions);
-    assert.ok(actions.includes("codeconnections:UseConnection"));
     assert.ok(!actions.some((a: string) => a.endsWith(":*") || a === "*"), "no wildcard actions");
+    assert.ok(actions.every((a: string) => a.startsWith("ecr:")), "registry access only: no Git source");
     const ecr = stmts.find((x) => x.actions.includes("ecr:BatchGetImage"));
     assert.deepEqual(ecr.resources, [ecrArn(cfg.ecr.internalPrefix)]);
-    const cc = stmts.find((x) => x.actions.includes("codeconnections:UseConnection"));
-    assert.deepEqual(cc.resources, ["${aws_codeconnections_connection.deploy_repo.arn}"]);
   });
 });
 
-describe("CodeConnections host for the private GHES", () => {
-  test("host is GitHub Enterprise Server, inside the tooling VPC", () => {
-    const h = one(s, "aws_codeconnections_host");
-    assert.equal(h.provider_type, "GitHubEnterpriseServer");
-    assert.equal(h.provider_endpoint, cfg.ghes.url);
-    const vpc = asArray<any>(h.vpc_configuration)[0];
-    assert.equal(vpc.vpc_id, cfg.vpcId);
-    assert.deepEqual(vpc.subnet_ids, cfg.privateSubnetIds);
+describe("no Git source for Argo CD: desired state comes from the registry", () => {
+  test("no CodeConnections host or connection", () => {
+    for (const t of ["aws_codeconnections_host", "aws_codeconnections_connection", "aws_codestarconnections_host", "aws_codestarconnections_connection"]) {
+      assert.equal(resources(s, t).length, 0, t);
+    }
   });
 
-  test("the host's security group can only reach GHES on 443", () => {
-    const egress = one(s, "aws_vpc_security_group_egress_rule");
-    assert.equal(egress.cidr_ipv4, cfg.ghes.cidr);
-    assert.equal(egress.from_port, 443);
-    assert.equal(egress.to_port, 443);
-    assert.equal(resources(s, "aws_vpc_security_group_ingress_rule").length, 0);
-  });
-
-  test("one connection on that host", () => {
-    assert.equal(one(s, "aws_codeconnections_connection").host_arn, "${aws_codeconnections_host.ghes.arn}");
+  test("nothing in the tooling stack takes an IP in a VPC (no security groups, no ENI owners)", () => {
+    for (const t of ["aws_security_group", "aws_vpc_security_group_egress_rule", "aws_vpc_security_group_ingress_rule"]) {
+      assert.equal(resources(s, t).length, 0, t);
+    }
   });
 });
 

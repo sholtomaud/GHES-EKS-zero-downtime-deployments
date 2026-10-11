@@ -27,7 +27,7 @@ Linux/CI. `CONTAINER=none` uses host tools instead (Node ≥ 22.18, OpenTofu ≥
 | Path | What |
 |---|---|
 | `src/config.ts` | Accounts, VPCs, environments. **PLACEHOLDER IDs**: replace before planning. |
-| `src/stacks/tooling-stack.ts` | Tooling account: GHES OIDC roles for the existing ECR, CodeConnections, delivery hub, managed Argo CD |
+| `src/stacks/tooling-stack.ts` | Tooling account: GHES OIDC roles for the existing ECR, delivery hub, managed Argo CD (reads ECR only) |
 | `src/stacks/workload-stack.ts` | Each workload account: Fargate-only EKS, access, LB controller IRSA, logs, TLS |
 | `src/stacks/base.ts` | Backend, provider, naming (`snake_case`, `name:qualifier`), `Group` = output file |
 | `src/layout.ts` | Splits each stack into `terraform.tf`, `backend.tf`, `providers.tf`, `locals.tf`, `<group>.tf` |

@@ -1,0 +1,13 @@
+# nonprod: platform values. PLACEHOLDER IDs (match infra/src/config.ts).
+logging:
+  region: ap-southeast-2
+  logGroupName: /aws/eks/app-nonprod/containers
+aws-load-balancer-controller:
+  clusterName: app-nonprod
+  region: ap-southeast-2 # Fargate has no IMDS: region and VPC must be explicit
+  vpcId: vpc-0nonprod0000000000
+  replicaCount: 2
+  serviceAccount:
+    name: aws-load-balancer-controller
+    annotations:
+      eks.amazonaws.com/role-arn: arn:aws:iam::333333333333:role/app-nonprod-aws-load-balancer-controller

@@ -1,0 +1,4 @@
+# Filled from environments/<env>/platform-values.yaml at packaging time.
+logging:
+  region: ""
+  logGroupName: ""

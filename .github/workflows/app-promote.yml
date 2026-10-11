@@ -1,11 +1,17 @@
 # Reusable promotion workflow: the release decision that deploys [DEP-02] [DEP-03].
 #
-#   GHES Environment approval (who/when/why)  ->  copy release by digest
-#   Artifactory -> ECR (internal/* or release/*)  ->  verify digests unchanged
-#   ->  dev/nonprod/prod: commit the version to the deploy repo; managed Argo CD syncs it
-#   ->  ga: customers can now pull release/* from ECR; Artifactory build promoted
+#   GHES Environment approval (who/when/why)
+#   -> copy the release by digest Artifactory -> private ECR (internal/* or release/*)
+#   -> dev/nonprod/prod: package this environment's desired state as a Helm
+#      bundle (deploy/package.sh), store it in Artifactory with build-info, copy
+#      it by digest to private ECR internal/deploy/. Managed Argo CD tracks the
+#      highest bundle version there and rolls it out. No Git source, no
+#      CodeConnections: Argo CD reads only the private ECR copy with IAM.
+#   -> ga: customers can now pull release/* from ECR; Artifactory build promoted
 #
-# Caller (in the app repo):
+# Rollback = promote the previous version: a new, higher bundle wrapping it.
+#
+# Caller (in the app repo, which holds deploy/ copied from this repo):
 #   jobs:
 #     promote:
 #       uses: <org>/<this-repo>/.github/workflows/app-promote.yml@<sha>
@@ -14,10 +20,10 @@
 #
 # Configuration the caller needs:
 #   vars:    JF_URL, JF_OIDC_PROVIDER, ARTIFACTORY_DOCKER_REPO, ARTIFACTORY_HELM_REPO,
-#            ARTIFACTORY_GA_REPO, AWS_REGION, ECR_REGISTRY (<acct>.dkr.ecr.<region>.amazonaws.com),
-#            AWS_PROMOTE_ROLE_ARN (ghes-promote-internal), AWS_GA_ROLE_ARN (ghes-publish-ga),
-#            DEPLOY_REPO_NAME (e.g. app-deploy, same owner), DEPLOY_APP_CLIENT_ID
-#   secrets: DEPLOY_APP_PRIVATE_KEY (GitHub App allowed to push to the deploy repo)
+#            ARTIFACTORY_RELEASE_META_REPO, ARTIFACTORY_GA_REPO, ARTIFACTORY_EKS_CHARTS_URL
+#            (remote of https://aws.github.io/eks-charts), AWS_REGION,
+#            ECR_REGISTRY (<acct>.dkr.ecr.<region>.amazonaws.com),
+#            AWS_PROMOTE_ROLE_ARN (ghes-promote-internal), AWS_GA_ROLE_ARN (ghes-publish-ga)
 #   GHES Environments dev, nonprod, prod, ga with required reviewers on prod and ga.
 name: app-promote
 
@@ -37,6 +43,14 @@ on:
       chart-name:
         type: string
         default: app
+      component:
+        description: app (the release) | platform (LB controller + log router config)
+        type: string
+        default: app
+      deploy-path:
+        description: Directory holding package.sh, charts/ and environments/ (see deploy/ in this repo)
+        type: string
+        default: deploy
       runner:
         type: string
         default: ubuntu-24.04
@@ -59,6 +73,7 @@ jobs:
       TARGET: ${{ inputs.environment }}
       SERVICES: ${{ inputs.services }}
       CHART: ${{ inputs.chart-name }}
+      COMPONENT: ${{ inputs.component }}
       JF_URL: ${{ vars.JF_URL }}
       ECR: ${{ vars.ECR_REGISTRY }}
       BUILD_NAME: ${{ github.event.repository.name }}
@@ -67,6 +82,8 @@ jobs:
         run: |
           [[ "$TARGET" =~ ^(dev|nonprod|prod|ga)$ ]] || { echo "unknown environment '$TARGET'" >&2; exit 1; }
           [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]] || { echo "bad version '$VERSION'" >&2; exit 1; }
+          [[ "$COMPONENT" =~ ^(app|platform)$ ]] || { echo "unknown component '$COMPONENT'" >&2; exit 1; }
+          [[ "$COMPONENT" == app || "$TARGET" != ga ]] || { echo "the platform bundle is internal only" >&2; exit 1; }
           if [[ "$TARGET" == ga ]]; then echo "TIER=release" >> "$GITHUB_ENV"; else echo "TIER=internal" >> "$GITHUB_ENV"; fi
 
       - name: Set up JFrog CLI
@@ -105,7 +122,26 @@ jobs:
           echo "$JF_TOKEN" | oras login "$host" -u "$JF_USER" --password-stdin
           echo "$JF_TOKEN" | helm registry login "$host" -u "$JF_USER" --password-stdin
 
+      - name: Digest-checked copy helper
+        run: |
+          # copy <src@digest> <dst:tag> <expected-digest>: idempotent (ECR tags are
+          # immutable) and fails if the digest would change. -r brings referrers.
+          cat > "$RUNNER_TEMP/copy.sh" <<'SH'
+          copy() {
+            local have
+            have="$(oras manifest fetch --descriptor "$2" 2>/dev/null | jq -r .digest || true)"
+            if [[ -n "$have" ]]; then
+              [[ "$have" == "$3" ]] || { echo "$2 exists with a different digest ($have)" >&2; exit 1; }
+              echo "already present: $2"; return
+            fi
+            oras cp -r "$1" "$2"
+            have="$(oras manifest fetch --descriptor "$2" | jq -r .digest)"
+            [[ "$have" == "$3" ]] || { echo "digest changed in copy: $2 ($have != $3)" >&2; exit 1; }
+          }
+          SH
+
       - name: Read the digests the chart pins
+        if: inputs.component == 'app'
         env:
           HELM_REPO: ${{ vars.ARTIFACTORY_HELM_REPO }}
         run: |
@@ -120,22 +156,13 @@ jobs:
       # Copy by digest; referrers (signatures, SBOM) come along with -r. ECR tags
       # are immutable, so a re-promotion of the same version is a no-op.
       - name: Copy release Artifactory -> ECR, digests unchanged [REL-01] [REL-02]
+        if: inputs.component == 'app'
         env:
           DOCKER_REPO: ${{ vars.ARTIFACTORY_DOCKER_REPO }}
           HELM_REPO: ${{ vars.ARTIFACTORY_HELM_REPO }}
         run: |
           set -euo pipefail
-          copy() { # copy <src@digest-or-tag> <dst:tag> <expected-digest|"">
-            local have
-            have="$(oras manifest fetch --descriptor "$2" 2>/dev/null | jq -r .digest || true)"
-            if [[ -n "$have" ]]; then
-              [[ -z "$3" || "$have" == "$3" ]] || { echo "$2 exists with a different digest ($have)" >&2; exit 1; }
-              echo "already present: $2"; return
-            fi
-            oras cp -r "$1" "$2"
-            have="$(oras manifest fetch --descriptor "$2" | jq -r .digest)"
-            [[ -z "$3" || "$have" == "$3" ]] || { echo "digest changed in copy: $2 ($have != $3)" >&2; exit 1; }
-          }
+          source "$RUNNER_TEMP/copy.sh"
           for svc in $(jq -r '.[]' <<<"$SERVICES"); do
             d="$(jq -r --arg s "$svc" '.[$s]' digests.json)"
             copy "$JF_HOST/$DOCKER_REPO/$svc@$d" "$ECR/$TIER/$svc:$VERSION" "$d"
@@ -144,40 +171,54 @@ jobs:
           copy "$JF_HOST/$HELM_REPO/$CHART@$chart_digest" "$ECR/$TIER/charts/$CHART:$VERSION" "$chart_digest"
           echo "CHART_DIGEST=$chart_digest" >> "$GITHUB_ENV"
 
-      # --- dev / nonprod / prod: the deploy repo is the desired state ---------
-      - name: Token for the deploy repo
+      # --- dev / nonprod / prod: the desired state is a Helm bundle -------------
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         if: inputs.environment != 'ga'
-        id: app-token
-        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
-        with:
-          client-id: ${{ vars.DEPLOY_APP_CLIENT_ID }}
-          private-key: ${{ secrets.DEPLOY_APP_PRIVATE_KEY }}
-          github-api-url: ${{ github.api_url }}
-          owner: ${{ github.repository_owner }}
-          repositories: ${{ vars.DEPLOY_REPO_NAME }}
-          permission-contents: write
 
-      - name: Commit the version to the deploy repo (Argo CD syncs it)
+      - name: Package this environment's bundle
         if: inputs.environment != 'ga'
         env:
-          GH_TOKEN: ${{ steps.app-token.outputs.token }}
-          DEPLOY_REPO: ${{ github.repository_owner }}/${{ vars.DEPLOY_REPO_NAME }}
+          HELM_REPO: ${{ vars.ARTIFACTORY_HELM_REPO }}
+          EKS_CHARTS_REPO: ${{ vars.ARTIFACTORY_EKS_CHARTS_URL }}
+          DEPLOY_PATH: ${{ inputs.deploy-path }}
         run: |
           set -euo pipefail
-          server="${GITHUB_SERVER_URL#https://}"
-          git clone --depth 1 "https://x-access-token:${GH_TOKEN}@${server}/${DEPLOY_REPO}.git" deploy
-          cd deploy
-          file="environments/$TARGET/app.yaml"
-          # The chart version is the only thing a promotion changes [ENV-01].
-          sed -i -E "s|^( *targetRevision: ).*(# x-release-version)$|\1\"$VERSION\" \2|" "$file"
-          grep -q "targetRevision: \"$VERSION\" # x-release-version" "$file" || { echo "marker not found in $file" >&2; exit 1; }
-          if git diff --quiet; then echo "$TARGET already at $VERSION"; exit 0; fi
-          git config user.name "app-promote[bot]"
-          git config user.email "app-promote@users.noreply.${server}"
-          git commit -am "promote $CHART $VERSION to $TARGET" \
-            -m "Approved in GHES Environment '$TARGET' by ${{ github.actor }}." \
-            -m "Chart digest: $CHART_DIGEST" -m "Run: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
-          git push origin HEAD
+          # Strictly increasing, valid semver: Argo CD tracks the highest ("*").
+          bundle="1.0.$(date -u +%s)"
+          export APP_CHART_REPO="oci://$JF_HOST/$HELM_REPO" OUT="$RUNNER_TEMP/bundles"
+          if [[ "$COMPONENT" == app ]]; then
+            tgz="$(bash "$DEPLOY_PATH/package.sh" app "$TARGET" "$bundle" "$VERSION")"
+          else
+            tgz="$(bash "$DEPLOY_PATH/package.sh" platform "$TARGET" "$bundle")"
+          fi
+          echo "BUNDLE=$bundle" >> "$GITHUB_ENV"
+          echo "BUNDLE_TGZ=$tgz" >> "$GITHUB_ENV"
+
+      - name: Store the bundle in Artifactory (system of record, build-info)
+        if: inputs.environment != 'ga'
+        env:
+          HELM_REPO: ${{ vars.ARTIFACTORY_HELM_REPO }}
+          META_REPO: ${{ vars.ARTIFACTORY_RELEASE_META_REPO }}
+        run: |
+          set -euo pipefail
+          helm push "$BUNDLE_TGZ" "oci://$JF_HOST/$HELM_REPO/deploy"
+          build="$BUILD_NAME-deploy-$COMPONENT-$TARGET"
+          jf rt upload "$BUNDLE_TGZ" "$META_REPO/deploy/$COMPONENT-$TARGET/" --build-name="$build" --build-number="$BUNDLE" --flat
+          jf rt build-collect-env "$build" "$BUNDLE"
+          jf rt build-add-git "$build" "$BUNDLE"
+          jf rt build-publish "$build" "$BUNDLE"
+
+      - name: Copy the bundle to private ECR, digest unchanged (Argo CD reads it there)
+        if: inputs.environment != 'ga'
+        env:
+          HELM_REPO: ${{ vars.ARTIFACTORY_HELM_REPO }}
+        run: |
+          set -euo pipefail
+          source "$RUNNER_TEMP/copy.sh"
+          src="$JF_HOST/$HELM_REPO/deploy/$COMPONENT-$TARGET"
+          d="$(oras manifest fetch --descriptor "$src:$BUNDLE" | jq -r .digest)"
+          copy "$src@$d" "$ECR/internal/deploy/$COMPONENT-$TARGET:$BUNDLE" "$d"
+          echo "BUNDLE_DIGEST=$d" >> "$GITHUB_ENV"
 
       # --- ga: customers pull from ECR release/*; mark the build in Artifactory
       - name: Promote the build in Artifactory (GA)
@@ -188,5 +229,8 @@ jobs:
 
       - name: Summary
         run: |
-          echo "### $CHART $VERSION -> $TARGET" >> "$GITHUB_STEP_SUMMARY"
-          echo "ECR: \`$ECR/$TIER/charts/$CHART:$VERSION\` @ \`$CHART_DIGEST\`" >> "$GITHUB_STEP_SUMMARY"
+          {
+            echo "### $COMPONENT $VERSION -> $TARGET"
+            [[ -z "${CHART_DIGEST:-}" ]] || echo "Chart: \`$ECR/$TIER/charts/$CHART:$VERSION\` @ \`$CHART_DIGEST\`"
+            [[ -z "${BUNDLE:-}" ]] || echo "Bundle: \`$ECR/internal/deploy/$COMPONENT-$TARGET:$BUNDLE\` @ \`$BUNDLE_DIGEST\` (Argo CD picks the highest)"
+          } >> "$GITHUB_STEP_SUMMARY"

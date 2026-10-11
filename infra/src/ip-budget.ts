@@ -44,7 +44,7 @@ export function budget(profile: InstallProfile): Budget {
     loadBalancer: { steady: design.albPerAzMin * design.azs, peak: design.albPeakTotal },
     database: { steady: rdsEnis[profile], peak: rdsEnis[profile] },
     vpcEndpoints: { steady: 0, peak: 0 }, // not a constraint (Q14)
-    delivery: { steady: 0, peak: 0 }, // managed Argo CD runs outside the VPC; CodeConnections ENIs are in the tooling VPC
+    delivery: { steady: 0, peak: 0 }, // managed Argo CD runs outside the VPC and reads from ECR
   };
   const sum = (k: keyof Line) => Object.values(lines).reduce((n, l) => n + l[k], 0);
   return { steady: sum("steady"), peak: sum("peak"), lines };

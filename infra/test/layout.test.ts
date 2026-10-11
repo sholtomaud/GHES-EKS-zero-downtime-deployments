@@ -21,7 +21,7 @@ describe("file structure", () => {
   test("tooling: standard files first, then one file per concern", () => {
     assert.deepEqual(
       stacks.tooling.map((f) => f.path),
-      ["terraform.tf", "backend.tf", "providers.tf", "ghes_oidc.tf", "codeconnections.tf", "delivery_hub.tf", "argocd.tf"],
+      ["terraform.tf", "backend.tf", "providers.tf", "ghes_oidc.tf", "delivery_hub.tf", "argocd.tf"],
     );
   });
 

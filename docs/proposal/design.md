@@ -31,14 +31,12 @@ This design takes the [proposal](../../PROPOSAL.md) further, adding the requirem
 flowchart LR
   subgraph tooling[Tooling account]
     ghes[GHES on EC2<br/>Actions: Sonar, build, Xray] -->|images + chart + build-info| art[(Artifactory on EC2<br/>system of record)]
-    art -->|promote: oras cp by digest| ecr[(ECR<br/>internal/* · release/*)]
-    ghes -->|promote: commit version| repo[(app-deploy repo<br/>on GHES)]
-    cc[CodeConnections host<br/>ENIs in tooling VPC] --- repo
+    ghes -->|promote: env bundle + build-info| art
+    art -->|promote: oras cp by digest| ecr[(private ECR<br/>internal/* · internal/deploy/* · release/*)]
     subgraph hub[EKS delivery-hub · 0 pods]
       argo{{EKS Capability:<br/>managed Argo CD<br/>runs in AWS-owned infra}}
     end
-    argo -->|Git via| cc
-    argo -->|charts via IAM| ecr
+    argo -->|bundles + charts via IAM| ecr
   end
   subgraph wl[Workload accounts: dev · nonprod · prod]
     eks[EKS · all pods on Fargate<br/>app ×8 · CoreDNS · LB controller]
@@ -55,8 +53,8 @@ flowchart LR
 | Build, test, scan | GHES Actions with the **SonarQube Server** action, **JFrog CLI** (`setup-jfrog-cli`, OIDC) and **Xray** build scan | GHES/Artifactory: fixed, self-hosted |
 | Release unit | One Helm chart pinning all 8 digests (`digests.json` inside the chart), in Artifactory as OCI, recorded in **build-info** with the images | — |
 | Runtime registry | **The existing ECR** (we don't create or manage it), copied into from Artifactory by digest at promotion: `internal/*` for our envs, `release/*` for customers | ECR ✅ |
-| Deploy (our envs) | **EKS Capability for Argo CD** on a zero-pod hub cluster in the tooling account. Pulls Git via **CodeConnections**, charts from ECR via IAM, deploys to workload clusters via **EKS access entries** | ✅ |
-| Promotion | GHES Environment approval → copy to ECR → one commit to the deploy repo | — |
+| Deploy (our envs) | **EKS Capability for Argo CD** on a zero-pod hub cluster in the tooling account. **No Git source**: reads per-environment Helm bundles and charts from the **private ECR copy** via IAM, deploys to workload clusters via **EKS access entries**. GHES and Artifactory stay private. | ✅ |
+| Promotion | GHES Environment approval → copy release to ECR → package the env bundle, store it in Artifactory (build-info), copy it to ECR `internal/deploy/` | — |
 | Compute | **EKS, every pod on Fargate**: 1 IP per pod, no nodes, no DaemonSets | ✅ |
 | Logs / debug | Fargate's **built-in** Fluent Bit → **CloudWatch Logs**: Standard class in dev/nonprod (Live Tail), Infrequent Access in prod. `kubectl logs`/`exec` for live debugging. | ✅ |
 | IaC | **cdktn** (TypeScript) → **OpenTofu ≥ 1.13** root modules, one per account, state in **Artifactory** (Terraform Backend repository) | — |
@@ -77,7 +75,7 @@ O3 and O8 draw the line. Anything a customer also runs must be portable. Everyth
 | Helm chart + `values.schema.json` + profiles | ✅ | Portable; no cloud dependency [PORT-07] | — |
 | Zero-downtime behaviour (probes, preStop, PDB, surge) | ✅ | In the chart [PORT-08] | — |
 | ECR `release/*` | ✅ (they pull from it) | Read-only, per-customer IAM principal | — |
-| Argo CD, deploy repo, promote workflow | ❌ | — | Managed Argo CD, GHES |
+| Argo CD, env bundles (`deploy/`), promote workflow | ❌ | — | Managed Argo CD, GHES |
 | EKS, Fargate, ALB, ACM, CloudWatch | ❌ | — | Managed AWS |
 | IaC (cdktn) | ❌ | — | Our accounts only |
 
@@ -96,7 +94,7 @@ with `helm template`, while customers run `helm upgrade`.
 |---|---|---|---|
 | How | One Argo CD capability on a **zero-pod** `delivery-hub` EKS cluster. It manages dev/nonprod/prod clusters by ARN through access entries. | Each workload cluster has its own capability and deploys to itself. | GHES starts a pipeline. CodeBuild in the VPC runs `helm upgrade`, gates, and rolls back. |
 | Where Argo runs | AWS-owned infra (0 pods anywhere) | AWS-owned infra (0 pods) | n/a |
-| Git access | One CodeConnections host, in the tooling VPC next to GHES | A CodeConnections path per account, so ENIs in each workload VPC or cross-account sharing *(unverified)* | n/a (no Git source) |
+| Desired-state source | Helm bundles in private ECR (copied from Artifactory). Argo CD can reach neither GHES nor Artifactory. | Same | n/a |
 | Drift | Reconciled continuously (`selfHeal`) | Same | Nightly `helm diff` job + alert |
 | Auto-rollback on bad metrics | Not built in. Rolling update stalls on failed readiness (old pods keep serving); a metric gate is a follow-up (§5.2) | Same | Scripted (ALB 5xx/latency gate, then `helm rollback`) |
 | Same command as customers | Chart + values, rendered with `helm template` | Same | `helm upgrade`, verbatim |
@@ -109,7 +107,7 @@ Weights are the defaults from [05-proposal-brief](../05-proposal-brief.md). Scor
 
 | Criterion (weight) | A | B | C | Notes |
 |---|---|---|---|---|
-| IP budget (25) | 5 | 4 | 5 | A: 0 pods, 0 workload-VPC ENIs. B: CodeConnections ENIs per workload VPC. C: 1 CodeBuild ENI during deploys. |
+| IP budget (25) | 5 | 4 | 5 | A: 0 pods, 0 workload-VPC ENIs. B: 0 too, but 3 capabilities. C: 1 CodeBuild ENI during deploys. |
 | Zero downtime and rollback (20) | 3 | 3 | 4 | All roll with `maxUnavailable: 0`. Only C has an automatic metric-based rollback today. |
 | Operational simplicity (20) | 5 | 3 | 3 | A: one declarative controller, no scripts, drift handled. B: 3× capabilities/IdC/connections. C: pipelines plus gate, rollback and drift scripts to own. |
 | Same artefact and interface as customers (15) | 4 | 4 | 5 | Argo renders with `helm template` (hooks differ, §5.3) |
@@ -126,9 +124,8 @@ work. C wins only because it already has an automatic metric gate. A wins on
 simplicity and on drift correction, and it is the only option that meets the
 owner's requirements O1 and O2. **Recommendation: A.** The ZDT gap closes
 with the post-sync gate in §5.2. B is rejected: it triples the managed
-footprint and puts CodeConnections ENIs in IP-constrained VPCs, for an
-isolation benefit that access-entry scoping and the hub's own controls mostly
-provide.
+footprint (3 capabilities, 3 Identity Center configs) for an isolation
+benefit that access-entry scoping and the hub's own controls mostly provide.
 
 ### 3.3 Where it runs: compute (unchanged from the proposal, re-checked)
 
@@ -163,7 +160,13 @@ already copies referrers, so signatures will travel to ECR once they exist.
 
 ## 5. Promote and deploy (Artifactory → ECR → Argo CD)
 
-Workflow: [`.github/workflows/app-promote.yml`](../../.github/workflows/app-promote.yml). Desired state: [`gitops/`](../../gitops/README.md), a template for the GHES `app-deploy` repo.
+Workflow: [`.github/workflows/app-promote.yml`](../../.github/workflows/app-promote.yml). Desired state: [`deploy/`](../../deploy/README.md), Helm bundles per environment.
+
+**Why not Git or Artifactory as Argo CD's source:** the managed capability runs
+in AWS-owned infrastructure with no route into our VPC, so it can reach
+neither the private GHES nor the private Artifactory. CodeConnections would
+reach GHES, but costs a host, a security group and 2 tooling-VPC IPs. The
+owner chose to keep both private, with Argo CD reading the private ECR copy.
 
 ### 5.1 Flow and credentials
 
@@ -174,16 +177,16 @@ sequenceDiagram
   participant R as Approvers (GHES Environment)
   participant A as Artifactory
   participant E as ECR (tooling)
-  participant G as app-deploy repo
   participant H as Managed Argo CD (hub)
   participant K as EKS (Fargate)
   P->>R: promote app 1.14.0 → prod
   R-->>P: approved (who/when recorded)
   P->>A: read chart, digests.json (JFrog OIDC)
   P->>E: oras cp -r by digest, verify digest unchanged (AWS OIDC → ghes-promote-internal)
-  P->>G: commit targetRevision "1.14.0" (GitHub App token)
-  H->>G: poll via CodeConnections (IAM)
-  H->>E: pull chart (IAM, capability role)
+  P->>P: package bundle app-prod:1.0.<unix time> (customer chart vendored + prod values)
+  P->>A: helm push bundle + build-info (system of record)
+  P->>E: oras cp bundle by digest to internal/deploy/app-prod
+  H->>E: see higher bundle version (targetRevision "*"), pull it (IAM, capability role)
   H->>K: apply via access entry (no network path)
   K->>E: Fargate pulls images by digest (pod execution role)
 ```
@@ -192,8 +195,8 @@ sequenceDiagram
 |---|---|---|---|
 | Approve | Named reviewers | GHES login | Approve that one Environment |
 | Copy to ECR | Promote workflow | GHES OIDC → `ghes-promote-internal` (or `ghes-publish-ga`), 1 h session | Push to `internal/*` (or `release/*`) only |
-| Record desired state | Promote workflow | GitHub App installation token | Write to `app-deploy` only |
-| Deploy | Managed Argo CD | Capability role, in AWS | Read the deploy repo + `internal/*`; admin on workload clusters via access entries |
+| Record desired state | Promote workflow | JFrog OIDC (Artifactory), then the same AWS role | Push the bundle to Artifactory, copy it to `internal/deploy/*` |
+| Deploy | Managed Argo CD | Capability role, in AWS | Read ECR `internal/*` only; admin on workload clusters via access entries |
 | Read | Humans | SSO read-only role | `AmazonEKSAdminViewPolicy` only [SEC-01] |
 | Break-glass | On-call | `break-glass` role, alarmed | Cluster admin |
 
@@ -203,10 +206,10 @@ sequenceDiagram
 |---|---|
 | ZDT-01 rolling with no failed requests | Chart rules from PROPOSAL §2.3 (`maxUnavailable: 0`, readiness, preStop, PDB, LB readiness gates) |
 | ZDT-03 abort on failed health | New pods that never get ready **stall** the rollout and old pods keep serving. Argo marks the app *Degraded*. |
-| ZDT-02 rollback ≤ 5 min | **Promote the previous version**, or `git revert` the promotion commit. Same path, same rolling update. |
-| Metric gate (gap vs option C) | **Follow-up, slice 3:** after the commit, the promote job waits for Argo CD `Healthy`/`Synced` (Argo CD API on the capability endpoint), then watches the ALB target group's 5xx and p95 in CloudWatch for 10 min, and reverts the commit on breach. It's 30–50 lines of shell in the workflow, with no new component. Open question Q29: CI access to the capability's API. |
+| ZDT-02 rollback ≤ 5 min | **Promote the previous version.** That publishes a new, higher bundle wrapping the older release: same path, same rolling update. |
+| Metric gate (gap vs option C) | **Follow-up, slice 3:** after the bundle copy, the promote job waits for Argo CD `Healthy`/`Synced` (Argo CD API on the capability endpoint), then watches the ALB target group's 5xx and p95 in CloudWatch for 10 min, and on breach re-promotes the previous version (a new, higher bundle). It's 30–50 lines of shell in the workflow, with no new component. Open question Q29: CI access to the capability's API. |
 | DEP-06 serialised | GHES `concurrency` per environment, and Argo CD syncs one revision at a time |
-| DEP-09 what's running | `environments/<env>/app.yaml` in Git, the Argo CD UI (SSO), and GHES deployment history |
+| DEP-09 what's running | The Argo CD UI (SSO), the highest bundle tag in ECR `internal/deploy/app-<env>`, the Artifactory build `<repo>-deploy-app-<env>`, and GHES deployment history |
 | OPS-03 drift | `selfHeal: true` corrects drift continuously. Humans can't write anyway. |
 
 ### 5.3 Argo CD vs plain Helm (the DEP-01 caveat)
@@ -242,7 +245,7 @@ This is computed by [`infra/src/ip-budget.ts`](../../infra/src/ip-budget.ts) and
 
 Line F (surge) is folded into C at peak. Every profile leaves ≥ 47% of an 80-IP account free.
 
-**Tooling account** (not IP-constrained as far as we know; Q30): hub control-plane ENIs (2–4), plus CodeConnections host ENIs (1 per subnet, 2), so about **6 IPs** in the tooling VPC next to GHES and Artifactory.
+**Tooling account** (not IP-constrained as far as we know; Q30): hub control-plane ENIs only (2–4 IPs). Nothing else for delivery uses VPC IPs.
 
 ---
 
@@ -274,7 +277,7 @@ written by Fargate's **built-in** Fluent Bit (0 pods, 0 IPs) [OBS-04]:
 
 The class is fixed when the group is created, so changing it means a new
 group. Log-group IaC: `infra/.../logging.tf`. Router config:
-`gitops/environments/<env>/observability/aws-logging.yaml`. The router role can
+`deploy/charts/platform-env/templates/aws-logging.yaml`, values in `deploy/environments/<env>/platform-values.yaml`. The router role can
 only write streams in that one group, and can't create groups.
 
 ### 7.2 Debug toolkit (no extra components)
@@ -304,7 +307,7 @@ environment that's about **$15/month in dev or nonprod and $8/month in prod**.
 | Fargate log router | Built into Fargate | 0 | 0 | OBS-01/02/04 | AWS |
 | **EKS Capability: Argo CD** | AWS-owned infra, on `delivery-hub` | 0 | 0 | DEP-02/03/06/09, OPS-03, O1 | **AWS-managed** |
 | `delivery-hub` EKS control plane | Tooling account | 0 | 0 (tooling: 2–4) | Hosts the capability's CRDs | Platform, with EKS upgrades |
-| CodeConnections host + connection | Tooling VPC | 0 | 0 (tooling: 2) | Argo CD → private GHES | AWS-managed |
+| Env bundles `app-<env>`, `platform-<env>` | Artifactory (record) → private ECR `internal/deploy/*` | 0 | 0 | DEP-02/03/09, ENV-01 | Promote workflow; templates in `deploy/` |
 | ECR `internal/*`, `release/*` | **Existing, owned outside this repo** | — | 0 | REL-01/02, ZDT-02 (rollback without Artifactory), O8 | ECR owner. We rely on: immutable tags, a lifecycle rule keeping ≥ 10 releases, and a repo policy letting the workload accounts (Fargate pod execution roles), the Argo CD capability role and customer accounts pull. Our IaC only grants our roles access to these prefixes. |
 | ALB (one per env, IngressGroup), ACM | Workload | — | 2–8 | ZDT-07, ENV-04 | AWS-managed |
 | CloudWatch log group | Workload | — | 0 | OBS-* | AWS-managed |
@@ -357,7 +360,7 @@ ADR-0005 accepted.
 |---|---|---|
 | NET-01/02/03 | Fargate, 0-pod delivery | `ip-budget.test.ts`; `inventory-ip-usage.sh` in slice 2 |
 | DEP-01 | Same chart + values via Argo CD; customer path in conformance | Conformance suite; `values.yaml` review |
-| DEP-02/03 | GHES Environments + deploy-repo commit | Git log + GHES deployments |
+| DEP-02/03 | GHES Environments + env bundle (Artifactory build-info, copied to ECR) | GHES deployments + Artifactory build history |
 | DEP-04 | OIDC roles pinned to repo + environment | `tooling-stack.test.ts` |
 | DEP-05 | Private endpoints; Argo uses access entries | `workload-stack.test.ts` |
 | DEP-07 | 0 resident delivery pods | Component register; pod inventory |
@@ -380,7 +383,7 @@ must be checked against the docs in slice 2.
 | # | Claim the design relies on | Source | If wrong |
 |---|---|---|---|
 | V1 | The Argo CD capability runs off-cluster, reaches private EKS clusters without networking, and targets clusters by ARN via access entries, cross-account | [EKS Argo CD](https://docs.aws.amazon.com/eks/latest/userguide/argocd.html), [considerations](https://docs.aws.amazon.com/eks/latest/userguide/argocd-considerations.html), [deep dive](https://aws.amazon.com/blogs/containers/deep-dive-streamlining-gitops-with-amazon-eks-capability-for-argo-cd) | Option A fails; fall back to C |
-| V2 | Private GHES is reachable through a CodeConnections host in our VPC | [AWS blog, private Git repos](https://aws.amazon.com/blogs/containers/accessing-private-git-repositories-from-amazon-eks-capability-for-argo-cd/) | Mirror the deploy repo to CodeCommit, or put env config in ECR as OCI |
+| V2 | ~~Private GHES via CodeConnections~~: no longer used (no Git source). Argo CD reaches neither GHES nor Artifactory; it reads the private ECR copy. | — | — |
 | V3 | ECR Helm charts are usable directly by IAM, with no Repository config | [Configure repository access](https://docs.aws.amazon.com/eks/latest/userguide/argocd-configure-repositories.html) | Add a Repository secret |
 | V4 | Identity Center is required. The trust principal is `capabilities.eks.amazonaws.com`. RBAC roles are `ADMIN`/`EDITOR`/`VIEWER` with `SSO_GROUP` identities. | [Permissions](https://docs.aws.amazon.com/eks/latest/userguide/argocd-permissions.html), provider `aws_eks_capability` schema | Adjust `argocd.tf` |
 | V5 | Pricing: a base hourly charge per capability plus a charge per Argo CD Application-hour (rates not retrieved) | [EKS pricing](https://aws.amazon.com/eks/pricing/) | Cost line in §3.2 |
@@ -389,6 +392,7 @@ must be checked against the docs in slice 2.
 | V8 | A pure-Fargate cluster needs no `kube-proxy`/`vpc-cni` add-ons (`bootstrap_self_managed_addons = false`) | Inferred | Add the add-ons back; they'd schedule nowhere |
 | V9 | `kubectl debug` ephemeral containers work on Fargate | Not found | Use `--copy-to` |
 | V10 | cdktn behaviour (HCL renderer, `targetVersions`, `TERRAFORM_BINARY_NAME`) | Installed package source and types; cdktn.io blocked here | Covered by tests; recheck via the cdktn MCP server |
+| V11 | `targetRevision: "*"` resolves to the highest chart version for an **OCI** Helm source on the managed capability. Third-party guides confirm it for classic Helm repos; OCI support is disputed. | [semver tracking](https://oneuptime.com/blog/post/2026-02-26-argocd-semantic-versioning-tracking/view), [argo-cd#8475](https://github.com/argoproj/argo-cd/issues/8475) | The promote job pins the exact `targetRevision` on the hub Application from a tooling-VPC runner |
 
 Design risks:
 
@@ -407,7 +411,7 @@ Also added to [06-open-questions.md](../06-open-questions.md).
 | # | Question | Impact |
 |---|---|---|
 | Q29 | Can CI read Argo CD app health from the capability's API (token or IAM)? | Metric gate in §5.2 |
-| Q30 | How many free IPs does the tooling VPC have, and which subnets can the hub and CodeConnections use? | §6 tooling line |
+| Q30 | How many free IPs does the tooling VPC have, and which subnets can the hub use? | §6 tooling line |
 | Q31 | Is there an Identity Center instance (account or org) usable for Argo CD SSO? | V4 |
 | Q32 | Do customers have AWS accounts for ECR pull, or do some need IAM users or a pull-through mirror? | ADR-0007 |
 | Q34 | Which account and region hold the existing ECR, and does its owner already keep tags immutable, keep ≥ 10 releases, and allow cross-account pull for our workload accounts and the Argo CD capability role? | Fargate image pulls, Argo CD chart pulls, rollback without Artifactory (design.md §8) |

@@ -42,14 +42,8 @@ export interface ToolingConfig {
   ghes: {
     /** e.g. https://ghes.example.internal */
     url: string;
-    /** CIDR of the GHES instance, the only egress target of the CodeConnections host. */
-    cidr: string;
-    /** PEM of the CA that signed the GHES certificate, if private. */
-    tlsCertificate?: string;
     /** owner/repo of the application repo whose promote workflow pushes to ECR. */
     appRepository: string;
-    /** owner/repo of the GitOps deploy repo that Argo CD reads. */
-    deployRepository: string;
   };
   identityCenter: {
     instanceArn: string;
@@ -119,9 +113,7 @@ export const tooling: ToolingConfig = {
   kubernetesVersion,
   ghes: {
     url: "https://ghes.example.internal",
-    cidr: "10.10.0.10/32",
     appRepository: "platform/app",
-    deployRepository: "platform/app-deploy",
   },
   identityCenter: {
     instanceArn: "arn:aws:sso:::instance/ssoins-0000000000000000",

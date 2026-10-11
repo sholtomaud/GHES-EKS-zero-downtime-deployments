@@ -2,8 +2,11 @@
 // hub, a zero-pod EKS cluster that hosts the managed Argo CD capability.
 // See docs/proposal/design.md and ADR-0004.
 //
-// Each Group below synthesises to its own file: ghes_oidc.tf,
-// codeconnections.tf, delivery_hub.tf, argocd.tf.
+// Argo CD has no Git source: it reads charts and per-environment desired-state
+// bundles from ECR with its IAM role, so nothing here needs VPC access.
+//
+// Each Group below synthesises to its own file: ghes_oidc.tf, delivery_hub.tf,
+// argocd.tf.
 import type { Construct } from "constructs";
 import { IamOpenidConnectProvider } from "@cdktn/provider-aws/lib/iam-openid-connect-provider/index.js";
 import { IamRole } from "@cdktn/provider-aws/lib/iam-role/index.js";
@@ -13,10 +16,6 @@ import { EksCluster } from "@cdktn/provider-aws/lib/eks-cluster/index.js";
 import { EksCapability } from "@cdktn/provider-aws/lib/eks-capability/index.js";
 import { EksAccessEntry } from "@cdktn/provider-aws/lib/eks-access-entry/index.js";
 import { EksAccessPolicyAssociation } from "@cdktn/provider-aws/lib/eks-access-policy-association/index.js";
-import { CodeconnectionsHost } from "@cdktn/provider-aws/lib/codeconnections-host/index.js";
-import { CodeconnectionsConnection } from "@cdktn/provider-aws/lib/codeconnections-connection/index.js";
-import { SecurityGroup } from "@cdktn/provider-aws/lib/security-group/index.js";
-import { VpcSecurityGroupEgressRule } from "@cdktn/provider-aws/lib/vpc-security-group-egress-rule/index.js";
 import { BaseStack, Group, iamPolicy } from "./base.ts";
 import { names, type ToolingConfig, type WorkloadConfig } from "../config.ts";
 
@@ -63,33 +62,6 @@ export class ToolingStack extends BaseStack {
     ghesRole("ghes_promote_internal", workloads.map((w) => w.name), t.ecr.internalPrefix);
     ghesRole("ghes_publish_ga", ["ga"], t.ecr.releasePrefix);
 
-    // --- codeconnections.tf: managed Argo CD reaches the private GHES --------
-    const cc = new Group(this, "codeconnections");
-    const sg = new SecurityGroup(cc, "codeconnections", {
-      name: "codeconnections-ghes",
-      description: "CodeConnections host ENIs: HTTPS to GHES only",
-      vpcId: t.vpcId,
-      revokeRulesOnDelete: true,
-    });
-    new VpcSecurityGroupEgressRule(cc, "ghes_https", {
-      securityGroupId: sg.id,
-      ipProtocol: "tcp",
-      fromPort: 443,
-      toPort: 443,
-      cidrIpv4: t.ghes.cidr,
-      description: "GHES HTTPS",
-    });
-    const host = new CodeconnectionsHost(cc, "ghes", {
-      name: "ghes",
-      providerType: "GitHubEnterpriseServer",
-      providerEndpoint: t.ghes.url,
-      vpcConfiguration: [
-        { vpcId: t.vpcId, subnetIds: t.privateSubnetIds, securityGroupIds: [sg.id], tlsCertificate: t.ghes.tlsCertificate },
-      ],
-    });
-    // Created PENDING; a GHES admin completes the handshake once in the console.
-    const connection = new CodeconnectionsConnection(cc, "deploy_repo", { name: "ghes-deploy-repo", hostArn: host.arn });
-
     // --- delivery_hub.tf: EKS control plane only, no pods -------------------
     const hubGroup = new Group(this, "delivery_hub");
     const eksTrust = iamPolicy(hubGroup, "eks_cluster_trust", [
@@ -127,8 +99,8 @@ export class ToolingStack extends BaseStack {
       },
     ]);
     const sources = iamPolicy(argo, "argocd_sources", [
-      { sid: "DeployRepo", effect: "Allow", actions: ["codeconnections:UseConnection", "codeconnections:GetConnection"], resources: [connection.arn] },
       { sid: "EcrAuth", effect: "Allow", actions: ["ecr:GetAuthorizationToken"], resources: ["*"] },
+      // The app chart and the per-environment desired-state bundles (deploy/*).
       { sid: "InternalCharts", effect: "Allow", actions: PULL_ACTIONS, resources: [repoArn(t.ecr.internalPrefix)] },
     ]);
     const capabilityRole = new IamRole(argo, "argocd_capability", {
