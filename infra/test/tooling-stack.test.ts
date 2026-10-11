@@ -123,6 +123,15 @@ describe("Managed Argo CD on a zero-pod hub cluster [DEP-03] [DEP-07] [OPS-03]",
     assert.deepEqual(byRole.VIEWER, [["SSO_GROUP", cfg.identityCenter.argocdViewerGroupId]]);
   });
 
+  test("the capability can manage Applications on the hub itself via an access entry", () => {
+    const entry = byName(s, "aws_eks_access_entry").argocd_hub;
+    assert.equal(entry.cluster_name, "${aws_eks_cluster.delivery_hub.name}");
+    assert.equal(entry.principal_arn, "${aws_iam_role.argocd_capability.arn}");
+    const assoc = byName(s, "aws_eks_access_policy_association").argocd_hub;
+    assert.equal(assoc.policy_arn, "arn:aws:eks::aws:cluster-access-policy/AmazonEKSClusterAdminPolicy");
+    assert.deepEqual(asArray<any>(assoc.depends_on), ["aws_eks_access_entry.argocd_hub"]);
+  });
+
   test("the capability role is assumable only by EKS capabilities, with a deterministic name", () => {
     const role = roles.argocd_capability;
     assert.equal(role.name, "eks-capability-argocd");

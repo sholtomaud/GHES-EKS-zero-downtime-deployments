@@ -15,6 +15,8 @@ import { IamRolePolicy } from "@cdktn/provider-aws/lib/iam-role-policy/index.js"
 import { IamRolePolicyAttachment } from "@cdktn/provider-aws/lib/iam-role-policy-attachment/index.js";
 import { EksCluster } from "@cdktn/provider-aws/lib/eks-cluster/index.js";
 import { EksCapability } from "@cdktn/provider-aws/lib/eks-capability/index.js";
+import { EksAccessEntry } from "@cdktn/provider-aws/lib/eks-access-entry/index.js";
+import { EksAccessPolicyAssociation } from "@cdktn/provider-aws/lib/eks-access-policy-association/index.js";
 import { CodeconnectionsHost } from "@cdktn/provider-aws/lib/codeconnections-host/index.js";
 import { CodeconnectionsConnection } from "@cdktn/provider-aws/lib/codeconnections-connection/index.js";
 import { SecurityGroup } from "@cdktn/provider-aws/lib/security-group/index.js";
@@ -185,6 +187,21 @@ export class ToolingStack extends BaseStack {
       assumeRolePolicy: capabilityTrust.json,
     });
     new IamRolePolicy(argo, "argocd_sources:policy", { name: "argocd-sources", role: capabilityRole.id, policy: sources.json });
+
+    // Applications and cluster Secrets live on the hub; the capability does not
+    // register its own cluster, so grant it explicitly. (verify) narrower scope.
+    const hubEntry = new EksAccessEntry(argo, "argocd_hub", {
+      clusterName: hub.name,
+      principalArn: capabilityRole.arn,
+      type: "STANDARD",
+    });
+    new EksAccessPolicyAssociation(argo, "argocd_hub:association", {
+      clusterName: hub.name,
+      principalArn: capabilityRole.arn,
+      policyArn: "arn:aws:eks::aws:cluster-access-policy/AmazonEKSClusterAdminPolicy",
+      accessScope: { type: "cluster" },
+      dependsOn: [hubEntry],
+    });
 
     new EksCapability(argo, "argocd", {
       capabilityName: names.argocdCapability,

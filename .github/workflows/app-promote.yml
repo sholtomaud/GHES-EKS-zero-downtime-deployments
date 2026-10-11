@@ -1,0 +1,192 @@
+# Reusable promotion workflow: the release decision that deploys [DEP-02] [DEP-03].
+#
+#   GHES Environment approval (who/when/why)  ->  copy release by digest
+#   Artifactory -> ECR (internal/* or release/*)  ->  verify digests unchanged
+#   ->  dev/nonprod/prod: commit the version to the deploy repo; managed Argo CD syncs it
+#   ->  ga: customers can now pull release/* from ECR; Artifactory build promoted
+#
+# Caller (in the app repo):
+#   jobs:
+#     promote:
+#       uses: <org>/<this-repo>/.github/workflows/app-promote.yml@<sha>
+#       with: { version: "1.14.0", environment: prod }
+#       secrets: inherit
+#
+# Configuration the caller needs:
+#   vars:    JF_URL, JF_OIDC_PROVIDER, ARTIFACTORY_DOCKER_REPO, ARTIFACTORY_HELM_REPO,
+#            ARTIFACTORY_GA_REPO, AWS_REGION, ECR_REGISTRY (<acct>.dkr.ecr.<region>.amazonaws.com),
+#            AWS_PROMOTE_ROLE_ARN (ghes-promote-internal), AWS_GA_ROLE_ARN (ghes-publish-ga),
+#            DEPLOY_REPO_NAME (e.g. app-deploy, same owner), DEPLOY_APP_CLIENT_ID
+#   secrets: DEPLOY_APP_PRIVATE_KEY (GitHub App allowed to push to the deploy repo)
+#   GHES Environments dev, nonprod, prod, ga with required reviewers on prod and ga.
+name: app-promote
+
+on:
+  workflow_call:
+    inputs:
+      version:
+        type: string
+        required: true
+      environment:
+        description: dev | nonprod | prod | ga
+        type: string
+        required: true
+      services:
+        type: string
+        default: '["api","agent","frontend","service-4","service-5","service-6","service-7","service-8"]'
+      chart-name:
+        type: string
+        default: app
+      runner:
+        type: string
+        default: ubuntu-24.04
+
+permissions:
+  contents: read
+  id-token: write # OIDC to JFrog and AWS
+
+jobs:
+  promote:
+    runs-on: ${{ inputs.runner }}
+    environment: ${{ inputs.environment }} # approval gate and deployment record
+    # One promotion per environment at a time [DEP-06]; Argo CD also serialises syncs.
+    concurrency:
+      group: app-promote-${{ inputs.environment }}
+      cancel-in-progress: false
+    timeout-minutes: 30
+    env:
+      VERSION: ${{ inputs.version }}
+      TARGET: ${{ inputs.environment }}
+      SERVICES: ${{ inputs.services }}
+      CHART: ${{ inputs.chart-name }}
+      JF_URL: ${{ vars.JF_URL }}
+      ECR: ${{ vars.ECR_REGISTRY }}
+      BUILD_NAME: ${{ github.event.repository.name }}
+    steps:
+      - name: Validate inputs
+        run: |
+          [[ "$TARGET" =~ ^(dev|nonprod|prod|ga)$ ]] || { echo "unknown environment '$TARGET'" >&2; exit 1; }
+          [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]] || { echo "bad version '$VERSION'" >&2; exit 1; }
+          if [[ "$TARGET" == ga ]]; then echo "TIER=release" >> "$GITHUB_ENV"; else echo "TIER=internal" >> "$GITHUB_ENV"; fi
+
+      - name: Set up JFrog CLI
+        id: jf
+        uses: jfrog/setup-jfrog-cli@68c0efdc951dd2359bbbfa15c48bc67b3ae8e4d6 # v5.2.0
+        with:
+          version: 2.124.0
+          oidc-provider-name: ${{ vars.JF_OIDC_PROVIDER }}
+          ghe-base-url: ${{ github.api_url }}
+          disable-auto-build-publish: true
+
+      - name: AWS credentials (role can only push to its ECR prefix)
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          aws-region: ${{ vars.AWS_REGION }}
+          role-to-assume: ${{ inputs.environment == 'ga' && vars.AWS_GA_ROLE_ARN || vars.AWS_PROMOTE_ROLE_ARN }}
+          role-session-name: promote-${{ inputs.environment }}-${{ github.run_id }}
+
+      - uses: aws-actions/amazon-ecr-login@aded0d722166a37980e030aa969dda0bfe6b6947 # v2.1.7
+
+      - uses: oras-project/setup-oras@005458ad77f1c8facd38a094e4af2e69e5607ff4 # v2.0.2
+        with:
+          version: 1.3.4
+
+      - uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
+        with:
+          version: v4.3.0
+
+      - name: Log in to Artifactory (oras, helm)
+        env:
+          JF_USER: ${{ steps.jf.outputs.oidc-user }}
+          JF_TOKEN: ${{ steps.jf.outputs.oidc-token }}
+        run: |
+          host="${JF_URL#https://}"; host="${host%%/*}"
+          echo "JF_HOST=$host" >> "$GITHUB_ENV"
+          echo "$JF_TOKEN" | oras login "$host" -u "$JF_USER" --password-stdin
+          echo "$JF_TOKEN" | helm registry login "$host" -u "$JF_USER" --password-stdin
+
+      - name: Read the digests the chart pins
+        env:
+          HELM_REPO: ${{ vars.ARTIFACTORY_HELM_REPO }}
+        run: |
+          set -euo pipefail
+          helm pull "oci://$JF_HOST/$HELM_REPO/$CHART" --version "$VERSION" -d chart
+          tar -xzf "chart/$CHART-$VERSION.tgz" -C chart "$CHART/digests.json"
+          cp "chart/$CHART/digests.json" digests.json
+          for svc in $(jq -r '.[]' <<<"$SERVICES"); do
+            jq -e --arg s "$svc" '.[$s] | startswith("sha256:")' digests.json >/dev/null || { echo "chart has no digest for $svc" >&2; exit 1; }
+          done
+
+      # Copy by digest; referrers (signatures, SBOM) come along with -r. ECR tags
+      # are immutable, so a re-promotion of the same version is a no-op.
+      - name: Copy release Artifactory -> ECR, digests unchanged [REL-01] [REL-02]
+        env:
+          DOCKER_REPO: ${{ vars.ARTIFACTORY_DOCKER_REPO }}
+          HELM_REPO: ${{ vars.ARTIFACTORY_HELM_REPO }}
+        run: |
+          set -euo pipefail
+          copy() { # copy <src@digest-or-tag> <dst:tag> <expected-digest|"">
+            local have
+            have="$(oras manifest fetch --descriptor "$2" 2>/dev/null | jq -r .digest || true)"
+            if [[ -n "$have" ]]; then
+              [[ -z "$3" || "$have" == "$3" ]] || { echo "$2 exists with a different digest ($have)" >&2; exit 1; }
+              echo "already present: $2"; return
+            fi
+            oras cp -r "$1" "$2"
+            have="$(oras manifest fetch --descriptor "$2" | jq -r .digest)"
+            [[ -z "$3" || "$have" == "$3" ]] || { echo "digest changed in copy: $2 ($have != $3)" >&2; exit 1; }
+          }
+          for svc in $(jq -r '.[]' <<<"$SERVICES"); do
+            d="$(jq -r --arg s "$svc" '.[$s]' digests.json)"
+            copy "$JF_HOST/$DOCKER_REPO/$svc@$d" "$ECR/$TIER/$svc:$VERSION" "$d"
+          done
+          chart_digest="$(oras manifest fetch --descriptor "$JF_HOST/$HELM_REPO/$CHART:$VERSION" | jq -r .digest)"
+          copy "$JF_HOST/$HELM_REPO/$CHART@$chart_digest" "$ECR/$TIER/charts/$CHART:$VERSION" "$chart_digest"
+          echo "CHART_DIGEST=$chart_digest" >> "$GITHUB_ENV"
+
+      # --- dev / nonprod / prod: the deploy repo is the desired state ---------
+      - name: Token for the deploy repo
+        if: inputs.environment != 'ga'
+        id: app-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          client-id: ${{ vars.DEPLOY_APP_CLIENT_ID }}
+          private-key: ${{ secrets.DEPLOY_APP_PRIVATE_KEY }}
+          github-api-url: ${{ github.api_url }}
+          owner: ${{ github.repository_owner }}
+          repositories: ${{ vars.DEPLOY_REPO_NAME }}
+          permission-contents: write
+
+      - name: Commit the version to the deploy repo (Argo CD syncs it)
+        if: inputs.environment != 'ga'
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          DEPLOY_REPO: ${{ github.repository_owner }}/${{ vars.DEPLOY_REPO_NAME }}
+        run: |
+          set -euo pipefail
+          server="${GITHUB_SERVER_URL#https://}"
+          git clone --depth 1 "https://x-access-token:${GH_TOKEN}@${server}/${DEPLOY_REPO}.git" deploy
+          cd deploy
+          file="environments/$TARGET/app.yaml"
+          # The chart version is the only thing a promotion changes [ENV-01].
+          sed -i -E "s|^( *targetRevision: ).*(# x-release-version)$|\1\"$VERSION\" \2|" "$file"
+          grep -q "targetRevision: \"$VERSION\" # x-release-version" "$file" || { echo "marker not found in $file" >&2; exit 1; }
+          if git diff --quiet; then echo "$TARGET already at $VERSION"; exit 0; fi
+          git config user.name "app-promote[bot]"
+          git config user.email "app-promote@users.noreply.${server}"
+          git commit -am "promote $CHART $VERSION to $TARGET" \
+            -m "Approved in GHES Environment '$TARGET' by ${{ github.actor }}." \
+            -m "Chart digest: $CHART_DIGEST" -m "Run: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+          git push origin HEAD
+
+      # --- ga: customers pull from ECR release/*; mark the build in Artifactory
+      - name: Promote the build in Artifactory (GA)
+        if: inputs.environment == 'ga'
+        env:
+          GA_REPO: ${{ vars.ARTIFACTORY_GA_REPO }}
+        run: jf rt build-promote "$BUILD_NAME" "$VERSION" "$GA_REPO" --status=ga --copy=true --comment="GA by ${{ github.actor }}"
+
+      - name: Summary
+        run: |
+          echo "### $CHART $VERSION -> $TARGET" >> "$GITHUB_STEP_SUMMARY"
+          echo "ECR: \`$ECR/$TIER/charts/$CHART:$VERSION\` @ \`$CHART_DIGEST\`" >> "$GITHUB_STEP_SUMMARY"

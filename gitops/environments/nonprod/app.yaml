@@ -1,0 +1,31 @@
+# The application in nonprod: the customer chart from the ECR release cache plus this
+# environment's values. A promotion changes only targetRevision [ENV-01].
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: app-nonprod
+  namespace: argocd
+spec:
+  project: default
+  sources:
+    - repoURL: 111111111111.dkr.ecr.ap-southeast-2.amazonaws.com/internal/charts
+      chart: app
+      targetRevision: "0.0.0" # x-release-version
+      helm:
+        valueFiles:
+          - $values/environments/nonprod/values.yaml
+    - repoURL: https://codeconnections.ap-southeast-2.amazonaws.com/git-http/111111111111/ap-southeast-2/00000000-0000-0000-0000-000000000000/platform/app-deploy.git
+      targetRevision: main
+      ref: values
+  destination:
+    name: app-nonprod
+    namespace: app
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true # drift is corrected, not just detected [OPS-03]
+    syncOptions:
+      - CreateNamespace=true
+    retry:
+      limit: 3
+      backoff: { duration: 30s, factor: 2, maxDuration: 5m }

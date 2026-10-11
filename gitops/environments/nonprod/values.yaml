@@ -1,0 +1,13 @@
+# nonprod values: the same documented interface customers use (profile + adapter).
+# Keys are illustrative until the chart's values.schema.json exists (slice 1).
+profile: minimal
+global:
+  registry: 111111111111.dkr.ecr.ap-southeast-2.amazonaws.com/internal
+adapters:
+  aws:
+    enabled: true
+    ingress:
+      className: alb
+      groupName: app-nonprod # one shared ALB per environment
+      certificateArn: arn:aws:acm:ap-southeast-2:333333333333:certificate/PLACEHOLDER
+      readinessGates: true # [ZDT-07]
