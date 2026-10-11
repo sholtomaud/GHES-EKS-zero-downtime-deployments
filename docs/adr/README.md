@@ -9,6 +9,7 @@
 | [0005](0005-iac-cdk-terrain-opentofu.md) | IaC in CDK Terrain, synthesised to OpenTofu ≥ 1.13, test-first, containerised | Proposed |
 | [0006](0006-fargate-logging-and-debugging.md) | Logs from Fargate's built-in router to CloudWatch Logs, class per environment | Proposed |
 | [0007](0007-customer-distribution-via-ecr.md) | Customers pull GA releases from ECR `release/*` | Proposed |
+| [0003](0003-local-development-workflow.md) | Local development: one `make dev` across the three repos, generated data by default | Proposed |
 
 New ADRs use [template.md](template.md). Agents may create ADRs with status
 `Proposed`. Only humans move an ADR to `Accepted`.
