@@ -1,0 +1,23 @@
+{
+  "name": "infra",
+  "version": "0.1.0",
+  "private": true,
+  "description": "CDK Terrain (cdktn) stacks for the tooling and workload AWS accounts. Synthesises OpenTofu JSON.",
+  "type": "module",
+  "engines": {
+    "node": ">=22.18.0"
+  },
+  "scripts": {
+    "typecheck": "tsc -p .",
+    "test": "node --test \"test/**/*.test.ts\"",
+    "synth": "cdktn synth"
+  },
+  "dependencies": {
+    "@cdktn/provider-aws": "25.7.2",
+    "cdktn": "0.24.0",
+    "constructs": "10.7.0"
+  },
+  "devDependencies": {
+    "@types/node": "24.19.2"
+  }
+}

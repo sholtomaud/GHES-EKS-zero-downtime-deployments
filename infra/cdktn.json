@@ -1,0 +1,9 @@
+{
+  "language": "typescript",
+  "app": "node src/main.ts",
+  "output": "cdktn.out",
+  "sendCrashReports": "false",
+  "terraformProviders": [],
+  "terraformModules": [],
+  "context": {}
+}
