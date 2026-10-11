@@ -2,6 +2,9 @@
   "language": "typescript",
   "app": "node src/main.ts",
   "output": "cdktn.out",
+  "targetVersions": {
+    "opentofu": ">=1.13.0"
+  },
   "sendCrashReports": "false",
   "terraformProviders": [],
   "terraformModules": [],

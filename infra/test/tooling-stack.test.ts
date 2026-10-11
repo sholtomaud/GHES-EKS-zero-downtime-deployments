@@ -7,6 +7,7 @@ import { synth, resources, one, policy, asArray } from "./helpers.ts";
 
 const cfg = { ...tooling, customerAccountIds: ["555555555555"] };
 const s = synth(new ToolingStack(Testing.app(), "tooling", { tooling: cfg, workloads }));
+const roles = resources(s, "aws_iam_role");
 
 describe("ECR release cache and customer distribution [REL-01] [REL-02]", () => {
   const repos = resources(s, "aws_ecr_repository");
@@ -59,7 +60,6 @@ describe("GHES OIDC and promotion roles [DEP-04]", () => {
     assert.deepEqual(p.client_id_list, ["sts.amazonaws.com"]);
   });
 
-  const roles = resources(s, "aws_iam_role");
   const ghesRoles = roles.filter((r) => JSON.stringify(policy(r.assume_role_policy)).includes("_services/token"));
 
   test("two promotion roles: internal (dev/nonprod/prod) and GA (customer release)", () => {
@@ -129,7 +129,7 @@ describe("Managed Argo CD on a zero-pod hub cluster [DEP-03] [DEP-07] [OPS-03]",
     assert.ok(actions.includes("ecr:BatchGetImage"));
     assert.ok(!actions.some((a: string) => a.endsWith(":*") || a === "*"), "no wildcard actions");
     const ecrStmt = stmts.find((x: any) => x.Action.includes("ecr:BatchGetImage"));
-    for (const r of asArray<string>(ecrStmt.Resource)) assert.match(r, /repository\/internal\//);
+    for (const r of asArray<string>(ecrStmt.Resource)) assert.match(r, /aws_ecr_repository\.internal-/);
   });
 });
 

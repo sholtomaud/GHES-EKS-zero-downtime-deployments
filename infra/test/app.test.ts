@@ -3,15 +3,26 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { Testing } from "cdktn";
+import { readFileSync } from "node:fs";
 import { buildApp } from "../src/app.ts";
 
-const app = buildApp(Testing.app());
+// Same context the cdktn CLI passes, so stack validations see the real targets.
+const project = JSON.parse(readFileSync(new URL("../cdktf.json", import.meta.url), "utf8"));
+const app = buildApp(Testing.app({ context: { targetVersions: project.targetVersions } }));
 const stacks = app.node.children;
 const synthOf = (stack: unknown) => JSON.parse(Testing.synth(stack as never));
 
 test("the app synthesises one tooling stack and one stack per workload environment", () => {
   const ids = stacks.map((c) => c.node.id).sort();
   assert.deepEqual(ids, ["tooling", "workload-dev", "workload-nonprod", "workload-prod"]);
+});
+
+test("the project targets OpenTofu >= 1.13.0 only", () => {
+  assert.deepEqual(project.targetVersions, { opentofu: ">=1.13.0" });
+});
+
+test("every stack passes cdktn's own validations (feature/version support)", () => {
+  for (const stack of stacks) assert.deepEqual((stack as never as { runAllValidations(): void }).runAllValidations(), undefined, stack.node.id);
 });
 
 test("every stack requires OpenTofu >= 1.13.0", () => {
