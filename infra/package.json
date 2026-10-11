@@ -10,7 +10,8 @@
   "scripts": {
     "typecheck": "tsc -p .",
     "test": "node --test \"test/**/*.test.ts\"",
-    "synth": "cdktn synth"
+    "synth": "cdktn synth",
+    "test:coverage": "node --test --experimental-test-coverage --test-coverage-include=\"src/**\" --test-reporter=spec --test-reporter-destination=stdout --test-reporter=lcov --test-reporter-destination=coverage/lcov.info \"test/**/*.test.ts\""
   },
   "dependencies": {
     "@cdktn/provider-aws": "25.7.2",

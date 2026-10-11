@@ -37,7 +37,7 @@ else
 endif
 
 .DEFAULT_GOAL := help
-.PHONY: help runtime image doctor deps typecheck test synth validate plan shell ci clean print-runtime
+.PHONY: help runtime image doctor deps typecheck test coverage synth validate plan shell ci clean print-runtime
 
 help: ## List targets
 	@grep -E '^[a-z-]+:.*## ' $(MAKEFILE_LIST) | awk -F':.*## ' '{printf "  %-14s %s\n", $$1, $$2}'
@@ -77,6 +77,9 @@ typecheck: ## Typecheck with TypeScript 7 (tsgo)
 test: ## Run the infra unit tests
 	$(RUN) npm test
 
+coverage: ## Unit tests with lcov coverage (infra/coverage/lcov.info, read by SonarQube)
+	$(RUN) sh -c 'mkdir -p coverage && npm run test:coverage'
+
 synth: ## Synthesise OpenTofu JSON into infra/cdktn.out
 	$(RUN) cdktn synth
 
@@ -90,7 +93,7 @@ plan: synth ## tofu plan for one stack: make plan STACK=workload-dev
 shell: ## Interactive shell in the toolchain container
 	$(CONTAINER) run -it $(RUN_FLAGS) $(IMAGE) bash
 
-ci: image deps typecheck test validate ## Everything CI runs, in order
+ci: image doctor deps typecheck coverage validate ## Everything CI runs, in order
 
 clean: ## Remove build output (keeps node_modules)
 	rm -rf infra/cdktn.out infra/.tofu-plugin-cache
